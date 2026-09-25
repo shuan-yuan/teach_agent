@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 venv/
 .env
+.env.*
 
 # Node
 node_modules/
@@ -11,8 +12,16 @@ dist/
 
 # Database & uploads (contain student data)
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 backend/uploads/
 backend/exports/
+
+# Secrets
+*.pem
 
 # IDE
 .idea/
