@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Users, Plus, Pencil, Trash2, BookOpen, Award, BookX, X, Loader2, UserPlus } from "lucide-react";
 import { fetchStudents, createStudent, updateStudent, deleteStudent } from "../api/client";
 import type { Student } from "../types";
+import { SUBJECTS } from "../constants";
 
 function unwrap(r: any): Student[] { return Array.isArray(r) ? r : r?.students ?? []; }
 
@@ -116,8 +117,8 @@ function FormModal({ student, onClose, onDone }: { student: Student | null; onCl
           <div className="form-field"><label>年级</label><input className="form-input" value={grade} onChange={e => setGrade(e.target.value)} placeholder="八年级" /></div>
           <div className="form-field"><label>班级</label><input className="form-input" value={cls} onChange={e => setCls(e.target.value)} placeholder="3班" /></div>
         </div>
-        <div className="form-field"><label>学科</label><select className="form-select" value={subject} onChange={e => setSubject(e.target.value)}>
-          {["数学", "语文", "英语", "物理", "化学", "生物"].map(s => <option key={s}>{s}</option>)}
+        <div className="form-field"><label>默认学科</label><select className="form-select" value={subject} onChange={e => setSubject(e.target.value)}>
+          {SUBJECTS.map(s => <option key={s}>{s}</option>)}
         </select></div>
         <div className="modal-actions">
           <button className="btn-secondary" onClick={onClose}>取消</button>

@@ -18,6 +18,11 @@ DB_PATH = os.path.join(BASE_DIR, "edu_agent.db")
 
 SESSION_DAYS = 30
 
+# 科目维度 —— 前后端唯一来源（前端对应 frontend/src/constants.ts，改动需同步）
+SUBJECTS = ["语文", "数学", "英语", "物理", "化学", "生物"]
+SUBJECT_ALL = "全部"       # 前端「全部科目」视图的标识，不参与 SQL 筛选
+DEFAULT_SUBJECT = "数学"
+
 
 async def init_db():
     """初始化数据库表结构"""
@@ -98,6 +103,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS practice_sheets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 student_id INTEGER NOT NULL,
+                subject TEXT NOT NULL DEFAULT '',
                 title TEXT DEFAULT '',
                 questions TEXT DEFAULT '[]',
                 target_knowledge_points TEXT DEFAULT '[]',
@@ -120,6 +126,7 @@ async def init_db():
             "ALTER TABLE students ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE homework_submissions ADD COLUMN file_type TEXT DEFAULT 'image'",
             "ALTER TABLE homework_submissions ADD COLUMN content_text TEXT DEFAULT ''",
+            "ALTER TABLE practice_sheets ADD COLUMN subject TEXT NOT NULL DEFAULT ''",
         ):
             try:
                 await db.execute(stmt)
@@ -468,27 +475,41 @@ async def create_error_records(student_id: int, homework_id: int, errors: list):
         await db.close()
 
 
-async def get_error_records(user_id: int, student_id: int):
-    """错题记录 — 带 user_id 校验"""
+def _subject_error_filter(subject: str) -> tuple:
+    """错题按科目筛选的 SQL 片段。
+
+    科目记在作业表上（homework_submissions.subject），错题通过 homework_id 继承，
+    用 EXISTS 子查询就不必改动各处查询的 FROM/JOIN 结构。
+    """
+    if not subject:
+        return "", ()
+    return (" AND EXISTS (SELECT 1 FROM homework_submissions h"
+            " WHERE h.id = error_records.homework_id AND h.subject = ?)", (subject,))
+
+
+async def get_error_records(user_id: int, student_id: int, subject: str = ""):
+    """错题记录 — 带 user_id 校验；subject 非空时只返回该科目"""
     db = await get_db()
     try:
-        cursor = await db.execute(
-            """SELECT e.*, h.subject, h.created_at as homework_date
-               FROM error_records e
-               JOIN homework_submissions h ON e.homework_id = h.id
-               JOIN students s ON e.student_id = s.id
-               WHERE e.student_id = ? AND s.user_id = ?
-               ORDER BY e.created_at DESC""",
-            (student_id, user_id)
-        )
+        sql = """SELECT e.*, h.subject, h.created_at as homework_date
+                 FROM error_records e
+                 JOIN homework_submissions h ON e.homework_id = h.id
+                 JOIN students s ON e.student_id = s.id
+                 WHERE e.student_id = ? AND s.user_id = ?"""
+        params: list = [student_id, user_id]
+        if subject:
+            sql += " AND h.subject = ?"
+            params.append(subject)
+        sql += " ORDER BY e.created_at DESC"
+        cursor = await db.execute(sql, tuple(params))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
     finally:
         await db.close()
 
 
-async def get_error_stats(user_id: int, student_id: int):
-    """获取学生错题统计 — 带 user_id 校验"""
+async def get_error_stats(user_id: int, student_id: int, subject: str = ""):
+    """获取学生错题统计 — 带 user_id 校验；subject 非空时统计范围限定在该科目"""
     db = await get_db()
     try:
         owned = await db.execute(
@@ -497,27 +518,29 @@ async def get_error_stats(user_id: int, student_id: int):
         if not await owned.fetchone():
             return {"by_knowledge_point": [], "by_error_type": [], "by_difficulty": []}
 
+        sub_sql, sub_params = _subject_error_filter(subject)
+
         cursor = await db.execute(
-            """SELECT knowledge_point, COUNT(*) as count
-               FROM error_records WHERE student_id = ? AND knowledge_point != ''
-               GROUP BY knowledge_point ORDER BY count DESC""",
-            (student_id,)
+            f"""SELECT knowledge_point, COUNT(*) as count
+                FROM error_records WHERE student_id = ? AND knowledge_point != ''{sub_sql}
+                GROUP BY knowledge_point ORDER BY count DESC""",
+            (student_id, *sub_params)
         )
         by_knowledge = [dict(row) for row in await cursor.fetchall()]
 
         cursor = await db.execute(
-            """SELECT error_type, COUNT(*) as count
-               FROM error_records WHERE student_id = ? AND error_type != ''
-               GROUP BY error_type ORDER BY count DESC""",
-            (student_id,)
+            f"""SELECT error_type, COUNT(*) as count
+                FROM error_records WHERE student_id = ? AND error_type != ''{sub_sql}
+                GROUP BY error_type ORDER BY count DESC""",
+            (student_id, *sub_params)
         )
         by_error_type = [dict(row) for row in await cursor.fetchall()]
 
         cursor = await db.execute(
-            """SELECT difficulty, COUNT(*) as count
-               FROM error_records WHERE student_id = ?
-               GROUP BY difficulty ORDER BY difficulty""",
-            (student_id,)
+            f"""SELECT difficulty, COUNT(*) as count
+                FROM error_records WHERE student_id = ?{sub_sql}
+                GROUP BY difficulty ORDER BY difficulty""",
+            (student_id, *sub_params)
         )
         by_difficulty = [dict(row) for row in await cursor.fetchall()]
 
@@ -526,6 +549,60 @@ async def get_error_stats(user_id: int, student_id: int):
             "by_error_type": by_error_type,
             "by_difficulty": by_difficulty
         }
+    finally:
+        await db.close()
+
+
+async def get_subject_overview(user_id: int, student_id: int) -> list:
+    """该学生各科目的作业数 / 错题数 / 练习数 —— 前端科目切换器用。
+
+    科目取自「作业表里真实出现过的 subject」∪「已有练习记录里带的 subject」，
+    后者不能漏，否则会出现「有练习历史但 Tab 里找不到该科目」。
+    排序按 SUBJECTS 顺序，未知科目（含旧数据的空科目）排最后。
+    """
+    db = await get_db()
+    try:
+        owned = await db.execute(
+            "SELECT id FROM students WHERE id = ? AND user_id = ?", (student_id, user_id)
+        )
+        if not await owned.fetchone():
+            return []
+
+        cursor = await db.execute(
+            """SELECT h.subject as subject,
+                      COUNT(DISTINCT h.id) as homework_count,
+                      COUNT(e.id) as error_count
+               FROM homework_submissions h
+               LEFT JOIN error_records e ON e.homework_id = h.id
+               WHERE h.student_id = ?
+               GROUP BY h.subject""",
+            (student_id,)
+        )
+        merged: dict = {}
+        for r in (dict(x) for x in await cursor.fetchall()):
+            subj = (r.get("subject") or "").strip() or "未分类"
+            merged[subj] = {
+                "subject": subj,
+                "homework_count": r["homework_count"],
+                "error_count": r["error_count"],
+                "practice_count": 0,
+            }
+
+        cursor = await db.execute(
+            """SELECT subject, COUNT(*) as c FROM practice_sheets
+               WHERE student_id = ? AND subject != '' GROUP BY subject""",
+            (student_id,)
+        )
+        for r in (dict(x) for x in await cursor.fetchall()):
+            merged.setdefault(r["subject"], {
+                "subject": r["subject"], "homework_count": 0,
+                "error_count": 0, "practice_count": 0,
+            })
+            merged[r["subject"]]["practice_count"] = r["c"]
+
+        order = {s: i for i, s in enumerate(SUBJECTS)}
+        return sorted(merged.values(),
+                      key=lambda x: (order.get(x["subject"], 99), x["subject"]))
     finally:
         await db.close()
 
@@ -600,7 +677,8 @@ async def get_student_profile(user_id: int, student_id: int) -> dict:
 # ============ Practice Sheet Operations ============
 
 async def create_practice_sheet(user_id: int, student_id: int, title: str, questions: str,
-                                 target_knowledge_points: str, pdf_path: str = ""):
+                                 target_knowledge_points: str, pdf_path: str = "",
+                                 subject: str = ""):
     db = await get_db()
     try:
         cursor = await db.execute(
@@ -610,9 +688,9 @@ async def create_practice_sheet(user_id: int, student_id: int, title: str, quest
             return None
         cursor = await db.execute(
             """INSERT INTO practice_sheets
-               (student_id, title, questions, target_knowledge_points, pdf_path)
-               VALUES (?, ?, ?, ?, ?)""",
-            (student_id, title, questions, target_knowledge_points, pdf_path)
+               (student_id, subject, title, questions, target_knowledge_points, pdf_path)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (student_id, subject, title, questions, target_knowledge_points, pdf_path)
         )
         await db.commit()
         return cursor.lastrowid
@@ -620,8 +698,8 @@ async def create_practice_sheet(user_id: int, student_id: int, title: str, quest
         await db.close()
 
 
-async def get_practice_sheets(user_id: int, student_id: int = None):
-    """练习列表 — 只返回当前用户的数据"""
+async def get_practice_sheets(user_id: int, student_id: int = None, subject: str = ""):
+    """练习列表 — 只返回当前用户的数据；subject 非空时只返回该科目"""
     db = await get_db()
     try:
         sql = """SELECT p.*, s.name as student_name
@@ -632,6 +710,9 @@ async def get_practice_sheets(user_id: int, student_id: int = None):
         if student_id:
             sql += " AND p.student_id = ?"
             params.append(student_id)
+        if subject:
+            sql += " AND p.subject = ?"
+            params.append(subject)
         sql += " ORDER BY p.created_at DESC"
         cursor = await db.execute(sql, params)
         rows = await cursor.fetchall()

@@ -38,6 +38,32 @@ for _fpath, _idx in _FONT_PATHS:
 EXPORTS_DIR = os.path.join(os.path.dirname(__file__), "exports")
 os.makedirs(EXPORTS_DIR, exist_ok=True)
 
+# Windows 文件名非法字符 + 路径分隔符
+_ILLEGAL_FS_CHARS = '<>:"/\\|?*'
+
+
+def safe_fs_name(name: str) -> str:
+    """把学生姓名 / 科目名转成安全的目录名（去掉非法字符，空格转下划线）"""
+    cleaned = "".join(
+        c for c in (name or "").strip() if c not in _ILLEGAL_FS_CHARS and ord(c) >= 32
+    )
+    return cleaned.replace(" ", "_") or "未命名"
+
+
+def subject_export_dir(student_name: str, subject: str = "") -> str:
+    """按「学生/科目」分层存放导出文件。
+
+    之前所有科目的 PDF 都平铺在 exports/ 一个目录下，看不出属于哪一科；
+    现在落到 exports/{学生}/{科目}/。旧记录里的 pdf_path 是绝对路径，
+    下载逻辑照原样读，不受目录调整影响。
+    """
+    parts = [safe_fs_name(student_name)]
+    if subject:
+        parts.append(safe_fs_name(subject))
+    path = os.path.join(EXPORTS_DIR, *parts)
+    os.makedirs(path, exist_ok=True)
+    return path
+
 
 def get_chinese_styles():
     """获取中文样式"""
@@ -156,7 +182,7 @@ def get_chinese_styles():
 
 
 def generate_practice_pdf(practice_data: dict, student_name: str = "",
-                           include_answers: bool = True) -> str:
+                           include_answers: bool = True, subject: str = "") -> str:
     """
     生成练习题 PDF
 
@@ -164,14 +190,16 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
         practice_data: 练习题数据（从 LLM 生成）
         student_name: 学生姓名
         include_answers: 是否包含答案和解析
+        subject: 科目 —— 决定标题文案与存放子目录 exports/{学生}/{科目}/
 
     Returns:
         生成的 PDF 文件路径
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = student_name.replace(' ', '_') if student_name else 'practice'
-    filename = f"practice_{safe_name}_{timestamp}.pdf"
-    filepath = os.path.join(EXPORTS_DIR, filename)
+    safe_name = safe_fs_name(student_name)
+    subject_part = f"_{safe_fs_name(subject)}" if subject else ""
+    filename = f"practice_{safe_name}{subject_part}_{timestamp}.pdf"
+    filepath = os.path.join(subject_export_dir(student_name, subject), filename)
 
     doc = SimpleDocTemplate(
         filepath,
@@ -186,7 +214,9 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
     story = []
 
     # === Title ===
-    title = practice_data.get('title', f'{student_name}专项练习')
+    title = practice_data.get('title') or f"{student_name}{subject}专项练习"
+    if subject and subject not in title:
+        title = f"{title}（{subject}）"   # 大模型给的标题常常不带科目，这里补齐
     story.append(Paragraph(title, styles['ChineseTitle']))
 
     # Subtitle
@@ -194,8 +224,9 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
     if description:
         story.append(Paragraph(description, styles['ChineseSubtitle']))
 
-    # Student info & date
-    info_text = f"学生: {student_name}    日期: {datetime.now().strftime('%Y年%m月%d日')}"
+    # Student info & date（科目单独标出，一叠 PDF 才好分辨是哪一科）
+    subject_text = f"    科目: {subject}" if subject else ""
+    info_text = f"学生: {student_name}{subject_text}    日期: {datetime.now().strftime('%Y年%m月%d日')}"
     story.append(Paragraph(info_text, styles['ChineseSmall']))
 
     story.append(Spacer(1, 6*mm))
@@ -330,12 +361,14 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
     return filepath
 
 
-def generate_error_report_pdf(student_name: str, errors: list, stats: dict) -> str:
-    """生成错题报告 PDF"""
+def generate_error_report_pdf(student_name: str, errors: list, stats: dict,
+                               subject: str = "") -> str:
+    """生成错题报告 PDF（按科导出时 subject 非空，标题与落盘目录都会带上科目）"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = student_name.replace(' ', '_')
-    filename = f"error_report_{safe_name}_{timestamp}.pdf"
-    filepath = os.path.join(EXPORTS_DIR, filename)
+    safe_name = safe_fs_name(student_name)
+    subject_part = f"_{safe_fs_name(subject)}" if subject else ""
+    filename = f"error_report_{safe_name}{subject_part}_{timestamp}.pdf"
+    filepath = os.path.join(subject_export_dir(student_name, subject), filename)
 
     doc = SimpleDocTemplate(
         filepath,
@@ -349,10 +382,12 @@ def generate_error_report_pdf(student_name: str, errors: list, stats: dict) -> s
     styles = get_chinese_styles()
     story = []
 
-    # Title
-    story.append(Paragraph(f"{student_name} 错题分析报告", styles['ChineseTitle']))
+    # Title（带科目，否则三个科目的错题报告长得一模一样）
+    label = f"{student_name} {subject}错题分析报告" if subject else f"{student_name} 错题分析报告"
+    story.append(Paragraph(label, styles['ChineseTitle']))
     story.append(Paragraph(
-        f"生成日期: {datetime.now().strftime('%Y年%m月%d日')}  共 {len(errors)} 道错题",
+        f"生成日期: {datetime.now().strftime('%Y年%m月%d日')}  共 {len(errors)} 道错题"
+        + (f"  科目: {subject}" if subject else ""),
         styles['ChineseSubtitle']
     ))
     story.append(Spacer(1, 6*mm))

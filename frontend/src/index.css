@@ -1032,3 +1032,71 @@ input, textarea, select { font-size: 16px; }
   .auth-card { padding: 24px 18px 20px; border-radius: 18px; }
   .mobile-header-user { max-width: 80px; }
 }
+
+/* ──────────────────────────────────────────
+   科目切换 Tab（错题分析 / 练习生成共用）
+   按钮固定 ≥44px 高，不随内容压缩；窄屏横向滚动
+   ────────────────────────────────────────── */
+.subject-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.subject-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1.5px solid var(--border, #E5E7EB);
+  border-radius: 12px;
+  background: var(--card, #fff);
+  color: var(--text-2, #4B5563);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  white-space: nowrap;
+}
+.subject-tab:hover { border-color: var(--coral, #F97362); }
+.subject-tab.active { box-shadow: 0 1px 6px rgba(0, 0, 0, 0.06); }
+.subject-tab .st-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.subject-tab .st-count {
+  background: var(--warm-gray, #F3F4F6);
+  border-radius: 999px;
+  padding: 0 7px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-3, #6B7280);
+}
+.subject-tab.active .st-count { background: rgba(255, 255, 255, 0.75); color: inherit; }
+.subject-tab .st-sub { font-size: 11px; font-weight: 500; color: var(--text-3, #6B7280); }
+
+/* 批量生成的结果卡片 */
+.batch-result {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border, #E5E7EB);
+  border-radius: 12px;
+  margin-bottom: 10px;
+  background: var(--card, #fff);
+}
+.batch-result .br-subject {
+  font-weight: 700;
+  font-size: 13px;
+  padding: 3px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+.batch-result .br-title { flex: 1; min-width: 0; font-size: 13px; color: var(--text-1, #111827); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.batch-result .br-meta { font-size: 12px; color: var(--text-3, #6B7280); white-space: nowrap; }
+
+@media (max-width: 639px) {
+  .subject-tabs { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 4px; }
+  .subject-tab { flex-shrink: 0; }
+  .batch-result { flex-wrap: wrap; }
+}

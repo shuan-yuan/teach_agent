@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { fetchStudents, uploadHomework, gradeHomeworkUrl, fetchHomeworkList, fetchHomeworkDetail, deleteHomework } from "../api/client";
 import type { Student, GradingResult, QuestionResult, HomeworkSubmission } from "../types";
+import { SUBJECTS, DEFAULT_SUBJECT } from "../constants";
 
 function unwrap(r: any): Student[] { return Array.isArray(r) ? r : r?.students ?? []; }
 const stepIcons: Record<string, any> = { upload: Upload, receive: Upload, parse: FileText, recognize: Eye, grading: PenLine, analyze: BarChart3, report: BarChart3, save: CheckCircle2 };
@@ -165,8 +166,14 @@ export default function GradingPage() {
   const [sp, setSp] = useSearchParams();
   const [students, setStudents] = useState<Student[]>([]);
   const [studentId, setSid] = useState<number | "">("");
-  const [subject, setSubject] = useState("数学");
+  const [subject, setSubject] = useState(DEFAULT_SUBJECT);
   const [files, setFiles] = useState<File[]>([]);
+
+  // 选中学生后自动带出该学生档案里的科目（下拉里仍可随时改）
+  useEffect(() => {
+    const stu = students.find(s => s.id === studentId);
+    if (stu?.subject) setSubject(stu.subject);
+  }, [studentId, students]);
   const [previews, setPreviews] = useState<(string | null)[]>([]);
   const [uploadTab, setUploadTab] = useState<"file" | "text">("file");
   const [contentText, setContentText] = useState("");
@@ -392,7 +399,7 @@ export default function GradingPage() {
             <div className="form-group">
               <label>学科</label>
               <select className="form-select" value={subject} onChange={e => setSubject(e.target.value)}>
-                {["数学", "语文", "英语", "物理", "化学"].map(s => <option key={s}>{s}</option>)}
+                {SUBJECTS.map(s => <option key={s}>{s}</option>)}
               </select>
             </div>
           </div>

@@ -6,8 +6,10 @@ import type {
   ErrorRecord,
   ErrorStats,
   PracticeSheet,
+  SubjectOverview,
   DashboardStats,
 } from '../types';
+import { SUBJECT_ALL } from '../constants';
 
 // Base URL is empty — dev server proxy / production same-origin both serve /api.
 const BASE = '';
@@ -275,9 +277,22 @@ export async function deleteHomework(
 
 export async function fetchStudentErrors(
   studentId: number,
+  subject?: string,
 ): Promise<{ errors: ErrorRecord[]; stats: ErrorStats }> {
+  const q = subject && subject !== SUBJECT_ALL
+    ? `?subject=${encodeURIComponent(subject)}`
+    : '';
   return request<{ errors: ErrorRecord[]; stats: ErrorStats }>(
-    `/api/students/${studentId}/errors`,
+    `/api/students/${studentId}/errors${q}`,
+  );
+}
+
+/** 科目概览：该学生各科目的作业数 / 错题数 / 练习数 */
+export async function fetchSubjectOverview(
+  studentId: number,
+): Promise<{ subjects: SubjectOverview[]; all_subjects: string[] }> {
+  return request<{ subjects: SubjectOverview[]; all_subjects: string[] }>(
+    `/api/students/${studentId}/subjects`,
   );
 }
 
@@ -293,6 +308,7 @@ export async function fetchStudentErrors(
 export async function generatePractice(
   studentId: number,
   errorIds?: number[],
+  subject?: string,
 ): Promise<ReadableStreamDefaultReader<Uint8Array>> {
   const res = await fetch(`${BASE}/api/practice/generate`, {
     method: 'POST',
@@ -301,6 +317,8 @@ export async function generatePractice(
     body: JSON.stringify({
       student_id: studentId,
       ...(errorIds !== undefined && { error_ids: errorIds }),
+      // 「全部」视图不带 subject，由后端决定兜底科目
+      ...(subject && subject !== SUBJECT_ALL && { subject }),
     }),
   });
 
@@ -320,8 +338,12 @@ export async function generatePractice(
 
 export async function fetchPracticeList(
   studentId?: number,
+  subject?: string,
 ): Promise<PracticeSheet[]> {
-  const query = studentId !== undefined ? `?student_id=${studentId}` : '';
+  const qs = new URLSearchParams();
+  if (studentId !== undefined) qs.set('student_id', String(studentId));
+  if (subject && subject !== SUBJECT_ALL) qs.set('subject', subject);
+  const query = qs.toString() ? `?${qs}` : '';
   const data = await request<any>(`/api/practice${query}`);
   return data?.practice_sheets ?? data ?? [];
 }
@@ -340,8 +362,11 @@ export function getPracticePdfUrl(practiceId: number): string {
 /**
  * Returns the URL to download an error-analysis report PDF for a student.
  */
-export function getErrorReportPdfUrl(studentId: number): string {
-  return `${BASE}/api/students/${studentId}/error-report-pdf`;
+export function getErrorReportPdfUrl(studentId: number, subject?: string): string {
+  const q = subject && subject !== SUBJECT_ALL
+    ? `?subject=${encodeURIComponent(subject)}`
+    : '';
+  return `${BASE}/api/students/${studentId}/error-report-pdf${q}`;
 }
 
 // ============================================================

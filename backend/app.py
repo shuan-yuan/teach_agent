@@ -563,19 +563,40 @@ async def get_homework_detail(homework_id: int, user: dict = Depends(auth.get_cu
 # ==================== Error Analysis ====================
 
 @app.get("/api/students/{student_id}/errors")
-async def get_student_errors(student_id: int, user: dict = Depends(auth.get_current_user)):
-    errors = await db.get_error_records(user["id"], student_id)
-    stats = await db.get_error_stats(user["id"], student_id)
-    return {"errors": errors, "stats": stats}
+async def get_student_errors(student_id: int, subject: str = Query(default=""),
+                             user: dict = Depends(auth.get_current_user)):
+    """错题列表 + 统计。subject 非空时只返回该科目，不传=全部科目"""
+    errors = await db.get_error_records(user["id"], student_id, subject=subject)
+    stats = await db.get_error_stats(user["id"], student_id, subject=subject)
+    return {"errors": errors, "stats": stats, "subject": subject}
+
+
+@app.get("/api/students/{student_id}/subjects")
+async def get_student_subjects(student_id: int, user: dict = Depends(auth.get_current_user)):
+    """该学生各科目的作业数/错题数/练习数 —— 前端科目 Tab 的数据源"""
+    student = await db.get_student(user["id"], student_id)
+    if not student:
+        raise HTTPException(404, "学生不存在")
+    return {
+        "subjects": await db.get_subject_overview(user["id"], student_id),
+        "all_subjects": db.SUBJECTS,
+    }
 
 
 # ==================== Practice Generation ====================
 
 @app.post("/api/practice/generate")
 async def generate_practice(data: dict, user: dict = Depends(auth.get_current_user)):
-    """生成练习题 — SSE 流式返回"""
+    """生成练习题 — SSE 流式返回。
+
+    科目取自请求参数（用户在练习页选的那一科），不再取 student.subject ——
+    后者是学生档案上的固定值，会把语文错题当数学来出题（本次修掉的 bug）。
+    """
     student_id = data.get("student_id")
     error_ids = data.get("error_ids", [])
+    subject = (data.get("subject") or "").strip()
+    if subject == db.SUBJECT_ALL:
+        subject = ""
 
     if not student_id:
         raise HTTPException(400, "请选择学生")
@@ -584,15 +605,23 @@ async def generate_practice(data: dict, user: dict = Depends(auth.get_current_us
     if not student:
         raise HTTPException(404, "学生不存在")
 
-    errors = await db.get_error_records(user["id"], student_id)
+    # 未指定科目（前端「全部」视图不选科直接调）时，挑错题最多的科目兜底。
+    # 关键：必须在取错题之前把科目定下来，否则会把多科错题混进同一个提示词
+    # —— 那正是这次要修掉的问题。
+    if not subject:
+        overview = await db.get_subject_overview(user["id"], student_id)
+        with_errors = [s for s in overview if s["error_count"] > 0]
+        subject = (max(with_errors, key=lambda s: s["error_count"])["subject"]
+                   if with_errors else db.DEFAULT_SUBJECT)
+
+    errors = await db.get_error_records(user["id"], student_id, subject=subject)
     if not errors:
-        raise HTTPException(400, "该学生暂无错题记录，请先批改作业")
+        raise HTTPException(400, f"该学生暂无{subject}错题记录，请先批改{subject}作业")
 
     if error_ids:
         errors = [e for e in errors if e["id"] in error_ids]
     errors = errors[:15]
 
-    subject = student.get("subject", "数学")
     try:
         student_profile = await db.get_student_profile(user["id"], student_id)
     except Exception:
@@ -615,7 +644,9 @@ async def generate_practice(data: dict, user: dict = Depends(auth.get_current_us
 
         if full_result:
             try:
-                pdf_path = generate_practice_pdf(full_result, student["name"])
+                pdf_path = generate_practice_pdf(
+                    full_result, student["name"], subject=subject
+                )
                 practice_id = await db.create_practice_sheet(
                     user["id"],
                     student_id,
@@ -623,6 +654,7 @@ async def generate_practice(data: dict, user: dict = Depends(auth.get_current_us
                     json.dumps(full_result.get("questions", []), ensure_ascii=False),
                     json.dumps(full_result.get("target_knowledge_points", []), ensure_ascii=False),
                     pdf_path,
+                    subject=subject,
                 )
                 yield f"data: {json.dumps({'type': 'done', 'data': {'practice_id': practice_id, 'pdf_path': pdf_path}}, ensure_ascii=False)}\n\n"
             except Exception as e:
@@ -641,8 +673,10 @@ async def generate_practice(data: dict, user: dict = Depends(auth.get_current_us
 
 @app.get("/api/practice")
 async def list_practice(student_id: Optional[int] = Query(None),
+                        subject: str = Query(default=""),
                         user: dict = Depends(auth.get_current_user)):
-    return {"practice_sheets": await db.get_practice_sheets(user["id"], student_id)}
+    return {"practice_sheets": await db.get_practice_sheets(user["id"], student_id,
+                                                             subject=subject)}
 
 
 @app.get("/api/practice/{practice_id}/pdf")
@@ -669,14 +703,18 @@ async def download_practice_pdf(practice_id: int, user: dict = Depends(auth.get_
 
 
 @app.get("/api/students/{student_id}/error-report-pdf")
-async def download_error_report(student_id: int, user: dict = Depends(auth.get_current_user)):
+async def download_error_report(student_id: int, subject: str = Query(default=""),
+                                user: dict = Depends(auth.get_current_user)):
+    """错题报告 PDF。subject 非空时只导出该科目，标题也会带科目"""
     student = await db.get_student(user["id"], student_id)
     if not student:
         raise HTTPException(404, "学生不存在")
 
-    errors = await db.get_error_records(user["id"], student_id)
-    stats = await db.get_error_stats(user["id"], student_id)
-    pdf_path = generate_error_report_pdf(student["name"], errors, stats)
+    errors = await db.get_error_records(user["id"], student_id, subject=subject)
+    if not errors:
+        raise HTTPException(400, f"暂无{subject}错题" if subject else "暂无错题记录")
+    stats = await db.get_error_stats(user["id"], student_id, subject=subject)
+    pdf_path = generate_error_report_pdf(student["name"], errors, stats, subject=subject)
     return FileResponse(
         pdf_path, media_type="application/pdf", filename=os.path.basename(pdf_path)
     )

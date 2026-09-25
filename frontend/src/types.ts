@@ -120,11 +120,21 @@ export interface PracticeSheet {
   id: number;
   student_id: number;
   student_name: string;
+  /** 该练习所属科目 —— 按科目生成与按科目筛选的依据 */
+  subject: string;
   title: string;
   questions: string;
   target_knowledge_points: string;
   pdf_path: string;
   created_at: string;
+}
+
+/** 科目概览：某学生各科目的作业数 / 错题数 / 练习数（前端科目 Tab 用） */
+export interface SubjectOverview {
+  subject: string;
+  homework_count: number;
+  error_count: number;
+  practice_count: number;
 }
 
 export interface PracticeData {
