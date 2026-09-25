@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { fetchStudents, uploadHomework, gradeHomeworkUrl, fetchHomeworkList, fetchHomeworkDetail, deleteHomework } from "../api/client";
 import type { Student, GradingResult, QuestionResult, HomeworkSubmission } from "../types";
-import { SUBJECTS, DEFAULT_SUBJECT } from "../constants";
+import { SUBJECTS, SUBJECT_AUTO } from "../constants";
 
 function unwrap(r: any): Student[] { return Array.isArray(r) ? r : r?.students ?? []; }
 const stepIcons: Record<string, any> = { upload: Upload, receive: Upload, parse: FileText, recognize: Eye, grading: PenLine, analyze: BarChart3, report: BarChart3, save: CheckCircle2 };
@@ -173,14 +173,10 @@ export default function GradingPage() {
   const [sp, setSp] = useSearchParams();
   const [students, setStudents] = useState<Student[]>([]);
   const [studentId, setSid] = useState<number | "">("");
-  const [subject, setSubject] = useState(DEFAULT_SUBJECT);
+  // 默认「自动识别」：由批改时的模型判科决定归档到哪一科。
+  // 曾经这里会带出「学生默认学科」，结果英语作业被自动贴成数学 —— 别再预填。
+  const [subject, setSubject] = useState(SUBJECT_AUTO);
   const [files, setFiles] = useState<File[]>([]);
-
-  // 选中学生后自动带出该学生档案里的科目（下拉里仍可随时改）
-  useEffect(() => {
-    const stu = students.find(s => s.id === studentId);
-    if (stu?.subject) setSubject(stu.subject);
-  }, [studentId, students]);
   const [previews, setPreviews] = useState<(string | null)[]>([]);
   const [uploadTab, setUploadTab] = useState<"file" | "text">("file");
   const [contentText, setContentText] = useState("");
@@ -408,8 +404,12 @@ export default function GradingPage() {
             <div className="form-group">
               <label>学科</label>
               <select className="form-select" value={subject} onChange={e => setSubject(e.target.value)}>
+                <option value={SUBJECT_AUTO}>{SUBJECT_AUTO}</option>
                 {SUBJECTS.map(s => <option key={s}>{s}</option>)}
               </select>
+                <span style={{ fontSize: 11, color: "var(--text-3)", marginTop: 4, display: "block" }}>
+                  {subject === SUBJECT_AUTO ? "按作业内容自动判科" : `全部按「${subject}」归档`}
+                </span>
             </div>
           </div>
 
@@ -468,7 +468,7 @@ export default function GradingPage() {
                   <div style={{ flex: 1 }}>
                     <div className="hi-title">
                       <span style={{ fontWeight: 600 }}>{hw.student_name}</span>
-                      <span style={{ color: "var(--text-3)", marginLeft: 8 }}>{hw.subject}</span>
+                      <span style={{ color: "var(--text-3)", marginLeft: 8 }}>{hw.subject || "未识别"}</span>
                     </div>
                     <div className="hi-date">{new Date(hw.created_at).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" })}</div>
                   </div>

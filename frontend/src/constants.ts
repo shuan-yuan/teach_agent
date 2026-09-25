@@ -10,6 +10,9 @@ export const SUBJECT_ALL = "全部";
 
 export const DEFAULT_SUBJECT = "数学";
 
+/** 「自动识别」：批改页学科下拉的默认档 —— 让模型按作业内容判科，不预填学生默认学科 */
+export const SUBJECT_AUTO = "自动识别";
+
 export type Subject = (typeof SUBJECTS)[number];
 
 /** 科目主题色：用于科目 Tab、科目标签、PDF 统计条 */

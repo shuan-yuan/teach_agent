@@ -21,7 +21,18 @@ SESSION_DAYS = 30
 # 科目维度 —— 前后端唯一来源（前端对应 frontend/src/constants.ts，改动需同步）
 SUBJECTS = ["语文", "数学", "英语", "物理", "化学", "生物"]
 SUBJECT_ALL = "全部"       # 前端「全部科目」视图的标识，不参与 SQL 筛选
+SUBJECT_AUTO = "自动识别"   # 前端「让模型自己认」的标识；入库时存空串，批改完成后回写真实科目
 DEFAULT_SUBJECT = "数学"
+
+
+def normalize_subject(value) -> str:
+    """把前端传来的科目值收敛成入库值。
+
+    只有出现在 SUBJECTS 里的才算真实科目；「自动识别」「全部」以及任何未知值
+    一律返回空串 = 「科目未定，等批改识别」。这样旧客户端或脏值不会污染科目维度。
+    """
+    v = (value or "").strip()
+    return v if v in SUBJECTS else ""
 
 
 async def init_db():
@@ -412,6 +423,26 @@ async def update_homework_result(homework_id: int, grading_result: str, thinking
             (grading_result, thinking_chain, score, total_questions, correct_count, homework_id)
         )
         await db.commit()
+    finally:
+        await db.close()
+
+
+async def update_homework_subject(homework_id: int, subject: str):
+    """批改完成后回写识别出的科目。
+
+    科目在上传时就写库了，那时模型还没看过作业内容 —— 所以「自动识别」模式
+    必须在拿到批改结果后补一刀。只回写真科目，避免把空串覆盖掉手选值。
+    """
+    if subject not in SUBJECTS:
+        return False
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE homework_submissions SET subject=? WHERE id=?",
+            (subject, homework_id)
+        )
+        await db.commit()
+        return True
     finally:
         await db.close()
 

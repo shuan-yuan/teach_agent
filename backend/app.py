@@ -323,7 +323,7 @@ async def upload_homework(
     user: dict = Depends(auth.get_current_user),
     files: list[UploadFile] = File(default=[]),
     student_id: int = Form(...),
-    subject: str = Form(default="数学"),
+    subject: str = Form(default=""),
     content_text: str = Form(default=""),
 ):
     """上传作业（图片/PDF/Word/纯文本），或直接提交文字内容。
@@ -333,6 +333,8 @@ async def upload_homework(
     """
     files = [f for f in files if f and f.filename]
     content_text = (content_text or "").strip()
+    # 「自动识别」/「全部」/任何未知值 → 空串 = 科目未定，批改时按内容识别后回写
+    subject = db.normalize_subject(subject)
 
     if not files and not content_text:
         raise HTTPException(400, "请上传文件或输入作业内容")
@@ -405,7 +407,7 @@ async def grade_homework(homework_id: int, user: dict = Depends(auth.get_current
     if not homework:
         raise HTTPException(404, "作业不存在")
 
-    subject = homework.get("subject", "数学")
+    subject = (homework.get("subject") or "").strip()   # 空 = 未定科目，批改时自动识别
     file_type = homework.get("file_type", "image")
     content_text = homework.get("content_text", "") or ""
 
@@ -495,6 +497,16 @@ async def grade_homework(homework_id: int, user: dict = Depends(auth.get_current
                 json.dumps(thinking_steps, ensure_ascii=False),
                 score, total_q, correct_c,
             )
+
+            # 「自动识别」模式：上传时科目是空的，这里拿到模型判科结果后回写。
+            # 手选科目时不回写 —— 用户的显式选择优先于模型判断。
+            # 这条事件刻意复用 step="subject"（与 llm_service 的「识别科目」同一步）：
+            # 前端 thinking 是按 step 去重的，所以对应那一行会从「识别科目：X」
+            # 升级成「已按「X」归档」，用户看到的是最终状态，不会多出一行冗余。
+            if not subject:
+                detected = (full_result.get("subject") or "").strip()
+                if await db.update_homework_subject(homework_id, detected):
+                    yield f"data: {json.dumps({'type': 'thinking', 'data': {'step': 'subject', 'message': f'🏷️ 已按「{detected}」归档', 'status': 'done'}}, ensure_ascii=False)}\n\n"
 
             errors = []
             for q in full_result.get("questions", []):

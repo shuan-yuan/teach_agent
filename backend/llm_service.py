@@ -184,18 +184,39 @@ class LLMService:
 
     # ==================== 作业批改 ====================
 
-    def _build_grading_prompt(self, subject: str) -> str:
-        """构建批改 prompt 文本"""
-        return f"""你是一个专业的{subject}教师，请仔细批改这份学生作业。
+    def _build_grading_prompt(self, subject: str = "") -> str:
+        """构建批改 prompt 文本。
 
-批改步骤：
+        subject 为空 = 「自动识别」：让模型自己判科，并把结果放进 JSON 的**第一个**
+        字段。放第一位是有意的 —— 输出被长度上限截断时，正则仍能从残缺 JSON 里抠出它。
+        """
+        if subject:
+            persona = f"你是一个专业的{subject}教师，请仔细批改这份学生作业。"
+            subject_rule = f'- subject 固定填「{subject}」'
+            subject_field = f'"subject": "{subject}",'
+            steps = """1. 识别图片中的每一道题目和学生的解答
+2. 逐题判断对错
+3. 只对错误的题目给出错因和正确解法"""
+        else:
+            persona = ("你是一个专业的中小学教师，请仔细批改这份学生作业。"
+                       "请先判断这份作业属于哪个科目。")
+            subject_rule = ('- subject 填这份作业的科目，只能从「语文/数学/英语/物理/化学/生物」'
+                            "中选一个；实在无法判断时填空字符串")
+            subject_field = '"subject": "科目名称（语文/数学/英语/物理/化学/生物 之一）",'
+            steps = """0. 判断科目（语文/数学/英语/物理/化学/生物 之一）
 1. 识别图片中的每一道题目和学生的解答
 2. 逐题判断对错
-3. 只对错误的题目给出错因和正确解法
+3. 只对错误的题目给出错因和正确解法"""
+        return f"""{persona}
+
+批改步骤：
+{steps}
 
 【输出长度要求 —— 非常重要，违反会导致 JSON 被截断而整份作废】
 - 只输出一个 JSON 对象，不要任何解释文字，不要用 markdown 代码块
 - 必须一次性输出**完整**的 JSON；题目较多时请把每项写得更精简，不要中途停下
+- subject 必须是单个科目词，不要写理由、不要加括号说明
+{subject_rule}
 - question_text 只写题号和算式/关键条件，16 字以内，不要整段抄写题干
 - is_correct 为 true 的题目：analysis 固定写「正确」，error_type 与 knowledge_point 写空字符串
 - is_correct 为 false 的题目：analysis 控制在 50 字以内，只讲错因和正确解法
@@ -203,6 +224,7 @@ class LLMService:
 
 JSON 格式：
 {{
+    {subject_field}
     "total_questions": 题目总数,
     "correct_count": 正确题数,
     "score": 得分(百分制,保留1位小数),
@@ -340,6 +362,70 @@ JSON 格式：
             "truncated": True,
         }
 
+    # ──────────────────────────────────────────────────────────
+    # 科目自动识别
+    # ──────────────────────────────────────────────────────────
+    # 科目是「每次作业的属性」。上传时模型还没看过内容，所以只能在批改结果里认。
+    # 取值优先级：模型返回 > 本地关键词兜底 > 空串（前端显示「未识别」）。
+    # 注意：真正的科目清单以 backend/database.py 的 SUBJECTS 为准，此处只做别名映射。
+
+    _SUBJECT_ALIASES = {
+        "语文": "语文", "chinese": "语文", "中文": "语文", "语文科": "语文", "国文": "语文",
+        "数学": "数学", "math": "数学", "maths": "数学", "mathematics": "数学", "算术": "数学",
+        "英语": "英语", "english": "英语", "英文": "英语", "英语科": "英语",
+        "物理": "物理", "physics": "物理",
+        "化学": "化学", "chemistry": "化学",
+        "生物": "生物", "biology": "生物",
+    }
+
+    # 只在模型没给科目时兜底。宁可返回空串也不乱猜 —— 猜错比不猜更糟。
+    _SUBJECT_KEYWORDS = {
+        "英语": ["english", "he ", "she ", "the ", "___", "choose the best", "translate",
+                 "reading comprehension", "past tense", "完形填空", "英译", "时态",
+                 "单词", "选词填空", "短文改错"],
+        "数学": ["计算", "解方程", "化简", "求值", "面积", "周长", "分数", "小数",
+                 "应用题", "竖式", "余数", "倍数", "因数"],
+        "语文": ["拼音", "组词", "造句", "古诗", "作者", "阅读短文", "作文", "笔画",
+                 "反义词", "近义词", "标点", "文言文", "照样子写", "填空并解释"],
+        "物理": ["压强", "密度", "电路", "欧姆", "浮力", "功率", "串联", "并联", "重力", "杠杆"],
+        "化学": ["化学式", "化学方程式", "元素符号", "摩尔", "配平", "溶液", "氧化", "化合价"],
+        "生物": ["细胞", "遗传", "光合作用", "生态系统", "染色体", "呼吸作用", "食物链"],
+    }
+
+    @classmethod
+    def _guess_subject(cls, text: str) -> str:
+        """模型没给科目时的本地关键词兜底 —— 宁可返回空串也不乱猜。"""
+        if not text:
+            return ""
+        low = text.lower()
+        scores = {s: sum(1 for k in kws if k in low)
+                  for s, kws in cls._SUBJECT_KEYWORDS.items()}
+        # 算式特征对数学是强信号
+        if re.search(r"\d+\s*[+\-×÷*/=]\s*\d+", text):
+            scores["数学"] = scores.get("数学", 0) + 2
+        best = max(scores, key=lambda s: scores[s])
+        if scores[best] < 2:
+            return ""
+        if list(scores.values()).count(scores[best]) > 1:   # 并列第一时不猜
+            return ""
+        return best
+
+    @classmethod
+    def _resolve_subject(cls, raw: str, hint_text: str = "") -> str:
+        """从模型原始输出里认出科目名。
+
+        刻意不看「解析后的 JSON」—— 输出被截断时 JSON 可能不完整，而 subject 被
+        要求放在最前面，直接正则抠原文反而更稳。模型不配合时退到本地关键词兜底。
+        """
+        m = re.search(r'"subject"\s*:\s*"([^"]{1,24})"', raw or "")
+        if m:
+            name = re.sub(r"[(（].*", "", m.group(1)).strip()
+            key = name.lower().replace(" ", "")
+            got = cls._SUBJECT_ALIASES.get(key) or cls._SUBJECT_ALIASES.get(name)
+            if got:
+                return got
+        return cls._guess_subject(hint_text or raw)
+
     @staticmethod
     def _describe_unparsable(raw: str, truncated_hint: bool) -> str:
         """生成可诊断的解析失败说明（含首尾片段，便于判断问题类型）"""
@@ -411,9 +497,12 @@ JSON 格式：
             f"请确认该模型支持视觉识别，或改用「文字输入」方式提交作业。"
         )
 
-    async def grade_homework(self, image_paths: list[str], subject: str = "数学") -> AsyncGenerator[dict, None]:
+    async def grade_homework(self, image_paths: list[str], subject: str = "") -> AsyncGenerator[dict, None]:
         """
         批改作业（视觉模式）- 流式返回思维链和结果
+
+        subject 为空 = 自动识别：让模型先判科，结果随 result 一起返回，
+        由调用方回写到作业记录（app.py 的 grade_homework 负责）。
         yields: {"type": "thinking"|"content"|"result"|"error", "data": ...}
         """
         if not self.configured:
@@ -560,6 +649,14 @@ JSON 格式：
                     "message": "📊 批改报告生成完成",
                     "status": "done"
                 }}
+                result["subject"] = subject or self._resolve_subject(full_response)
+                if not subject:
+                    yield {"type": "thinking", "data": {
+                        "step": "subject",
+                        "message": (f"🏷️ 识别科目：{result['subject']}" if result["subject"]
+                                    else "🏷️ 科目未能识别，可在批改记录里确认"),
+                        "status": "done"
+                    }}
                 yield {"type": "result", "data": result}
             except Exception as e:
                 yield {"type": "error", "data": f"批改结果解析失败：{e}（finish_reason={finish_reason}）"}
@@ -567,7 +664,7 @@ JSON 格式：
         except Exception as e:
             yield {"type": "error", "data": f"调用 LLM API 失败: {str(e)}"}
 
-    async def grade_homework_text(self, text: str, subject: str = "数学") -> AsyncGenerator[dict, None]:
+    async def grade_homework_text(self, text: str, subject: str = "") -> AsyncGenerator[dict, None]:
         """
         批改作业（文本模式）- 流式返回思维链和结果
         将文本内容作为 prompt 的一部分发送给 LLM，使用同样的 JSON 输出格式
@@ -603,8 +700,27 @@ JSON 格式：
             "status": "active"
         }}
 
-        # Build text-only prompt
-        prompt = f"""你是一个专业的{subject}教师，请仔细批改这份学生作业。
+        # Build text-only prompt（subject 为空 = 自动识别，理由同 _build_grading_prompt）
+        if subject:
+            persona = f"你是一个专业的{subject}教师，请仔细批改这份学生作业。"
+            subject_rule = f'- subject 固定填「{subject}」'
+            subject_field = f'"subject": "{subject}",'
+            steps = """1. 仔细识别以上文本中的每一道题目和学生的解答
+2. 逐题分析学生的解答过程和结果
+3. 判断每道题的对错
+4. 对错误的题目给出详细分析，指出错误原因和正确解法"""
+        else:
+            persona = ("你是一个专业的中小学教师，请仔细批改这份学生作业。"
+                       "请先判断这份作业属于哪个科目。")
+            subject_rule = ('- subject 填这份作业的科目，只能从「语文/数学/英语/物理/化学/生物」'
+                            "中选一个；实在无法判断时填空字符串")
+            subject_field = '"subject": "科目名称（语文/数学/英语/物理/化学/生物 之一）",'
+            steps = """0. 判断科目（语文/数学/英语/物理/化学/生物 之一）
+1. 仔细识别以上文本中的每一道题目和学生的解答
+2. 逐题分析学生的解答过程和结果
+3. 判断每道题的对错
+4. 对错误的题目给出详细分析，指出错误原因和正确解法"""
+        prompt = f"""{persona}
 
 以下是学生的作业内容：
 ------
@@ -612,13 +728,13 @@ JSON 格式：
 ------
 
 请按照以下步骤进行批改：
-1. 仔细识别以上文本中的每一道题目和学生的解答
-2. 逐题分析学生的解答过程和结果
-3. 判断每道题的对错
-4. 对错误的题目给出详细分析，指出错误原因和正确解法
+{steps}
+
+{subject_rule}
 
 请严格按照以下JSON格式返回批改结果（不要输出任何其他内容，只输出JSON）：
 {{
+    {subject_field}
     "total_questions": 题目总数,
     "correct_count": 正确题数,
     "score": 得分(百分制,保留1位小数),
@@ -722,6 +838,14 @@ JSON 格式：
                     "message": "📊 批改报告生成完成",
                     "status": "done"
                 }}
+                result["subject"] = subject or self._resolve_subject(full_response, hint_text=text)
+                if not subject:
+                    yield {"type": "thinking", "data": {
+                        "step": "subject",
+                        "message": (f"🏷️ 识别科目：{result['subject']}" if result["subject"]
+                                    else "🏷️ 科目未能识别，可在批改记录里确认"),
+                        "status": "done"
+                    }}
                 yield {"type": "result", "data": result}
             except Exception as e:
                 yield {"type": "error", "data": f"批改结果解析失败：{e}（finish_reason={finish_reason}）"}
