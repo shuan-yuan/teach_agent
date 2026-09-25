@@ -30,6 +30,77 @@ class LLMService:
         self.model = model_name
         self.configured = True
 
+    # 判定「这个报错是不是因为输出长度超限」的关键词。
+    # 宁可多降一档（多一次立即返回的 4xx，通常不计费），也不要漏降（整次批改写死）。
+    _LENGTH_HINTS = (
+        "max_tokens", "max_completion_tokens", "max_new_tokens",
+        "max_output_tokens", "output length", "output token", "output_length",
+        "token limit", "token_limit", "length",
+        "输出长度", "输出上限", "最大输出", "最多输出", "单次输出",
+        "输出token", "输出 token",
+    )
+    # 语义兜底：同时命中「容量词」与「超限词」也算
+    _CAPACITY_HINTS = ("token", "length", "长度", "输出", "output")
+    _OVERRUN_HINTS = ("超", "上限", "最大", "最多", "limit", "exceed",
+                      "too large", "too long", "maximum")
+    _MIN_MAX_TOKENS = 1024
+
+    @classmethod
+    def _looks_like_length_rejection(cls, err: Exception) -> bool:
+        """
+        判断报错是否属于「输出上限超了」这一类，决定要不要降级重试。
+
+        各家文案差异极大，实测遇到的形态：
+          含 max_tokens 的英文/中文文案        → 关键词命中
+          "output token limit exceeded ..."   → 关键词命中 output token
+          "超出最大输出长度，请调小输出长度"    → 关键词命中 输出长度
+          "该模型单次最多输出 4096 个 token"   → 只能靠语义组合命中
+
+        判定刻意偏宽松：漏判的代价是整次批改失败，多判一次的代价只是
+        一次立即返回的 4xx。就算真误判了别的原因（余额不足、key 无效），
+        试完所有档位后仍会把最后一个真实错误原样抛出，不会掩盖问题。
+        """
+        text = str(err).lower()
+        if any(h in text for h in cls._LENGTH_HINTS):
+            return True
+        return (any(c in text for c in cls._CAPACITY_HINTS)
+                and any(o in text for o in cls._OVERRUN_HINTS))
+
+    async def _create_stream(self, **kwargs):
+        """
+        发起对话请求（流式/非流式通用），max_tokens 超限时自动降级重试。
+
+        各家 OpenAI 兼容服务的输出上限差异极大：
+        例如 DeepSeek 的 deepseek-flash 支持 384K 输出，
+        而部分厂商只允许 8192/4096，超出会直接返回 4xx。
+        这里按阶梯逐级回退，**停在厂商能接受的最高档**（不会一路跌到底），
+        避免因为一个参数把整次批改写死。
+        传进来的 max_tokens 作为最高档，向下依次取半。
+        """
+        top = int(kwargs.pop("max_tokens", 8192) or 8192)
+        ladder = []
+        v = top
+        while v >= self._MIN_MAX_TOKENS:
+            ladder.append(v)
+            v //= 2
+        if not ladder:
+            ladder = [top]
+
+        last_err = None
+        for mt in ladder:
+            try:
+                return await self.client.chat.completions.create(max_tokens=mt, **kwargs)
+            except openai.APIStatusError as e:
+                status = getattr(e, "status_code", None)
+                if not (status and 400 <= status < 500):
+                    raise       # 5xx 是服务端问题，降级没有意义
+                if not self._looks_like_length_rejection(e):
+                    raise       # 与输出上限无关的报错，直接抛出，不要掩盖真实原因
+                last_err = e
+                print(f"[llm] max_tokens={mt} 被拒绝（HTTP {status}，输出上限），"
+                      f"降级重试：{str(e)[:140]}", flush=True)
+        raise last_err
+
     async def test_connection(self) -> dict:
         """测试 API 连接"""
         if not self.configured:
@@ -117,13 +188,20 @@ class LLMService:
         """构建批改 prompt 文本"""
         return f"""你是一个专业的{subject}教师，请仔细批改这份学生作业。
 
-请按照以下步骤进行批改：
-1. 仔细识别图片中的每一道题目和学生的解答
-2. 逐题分析学生的解答过程和结果
-3. 判断每道题的对错
-4. 对错误的题目给出详细分析，指出错误原因和正确解法
+批改步骤：
+1. 识别图片中的每一道题目和学生的解答
+2. 逐题判断对错
+3. 只对错误的题目给出错因和正确解法
 
-请严格按照以下JSON格式返回批改结果（不要输出任何其他内容，只输出JSON）：
+【输出长度要求 —— 非常重要，违反会导致 JSON 被截断而整份作废】
+- 只输出一个 JSON 对象，不要任何解释文字，不要用 markdown 代码块
+- 必须一次性输出**完整**的 JSON；题目较多时请把每项写得更精简，不要中途停下
+- question_text 只写题号和算式/关键条件，16 字以内，不要整段抄写题干
+- is_correct 为 true 的题目：analysis 固定写「正确」，error_type 与 knowledge_point 写空字符串
+- is_correct 为 false 的题目：analysis 控制在 50 字以内，只讲错因和正确解法
+- overall_comment 不超过 60 字；weak_points 最多 3 项
+
+JSON 格式：
 {{
     "total_questions": 题目总数,
     "correct_count": 正确题数,
@@ -145,8 +223,19 @@ class LLMService:
     "weak_points": ["薄弱知识点1", "薄弱知识点2"]
 }}"""
 
-    def _parse_json_response(self, full_response: str) -> dict:
-        """从 LLM 响应中提取 JSON 结果"""
+    def _parse_json_response(self, full_response: str, truncated_hint: bool = False) -> dict:
+        """
+        从 LLM 响应中提取 JSON 结果。
+
+        分四层尝试，避免「模型输出被长度上限截断」时整份作业白批：
+          1. 直接解析（含 ```json 代码块剥离）
+          2. 正则抠出最外层 {...}
+          3. 截断抢救：把已经完整的题目对象取出来，拼一份可用的部分结果
+          4. 都失败则抛出带诊断信息的异常（含截断位置），便于定位
+
+        Args:
+            truncated_hint: 调用方是否已判定输出被截断（finish_reason == "length"）
+        """
         json_str = full_response.strip()
 
         # 处理 markdown 代码块
@@ -155,14 +244,120 @@ class LLMService:
         elif "```" in json_str:
             json_str = json_str.split("```")[1].split("```")[0].strip()
 
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            # 尝试用正则提取 JSON
-            json_match = re.search(r'\{[\s\S]*\}', full_response)
-            if json_match:
-                return json.loads(json_match.group())
-            raise
+        candidates = [json_str]
+        json_match = re.search(r'\{[\s\S]*\}', full_response)
+        if json_match:
+            candidates.append(json_match.group())
+
+        for candidate in candidates:
+            try:
+                result = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(result, dict) and "questions" in result:
+                if truncated_hint:
+                    result["truncated"] = True
+                return result
+
+        # 第三层：截断抢救
+        salvaged = self._salvage_truncated_json(full_response)
+        if salvaged:
+            return salvaged
+
+        raise ValueError(self._describe_unparsable(full_response, truncated_hint))
+
+    @staticmethod
+    def _salvage_truncated_json(text: str):
+        """
+        从被截断的 JSON 里抢救出「已经完整」的题目对象。
+
+        模型输出被长度上限砍断时，前面若干道题通常是完整的，
+        把它们捞出来仍能给学生一份可用的批改结果，而不是全部作废。
+        返回 None 表示无法抢救。
+        """
+        anchor = re.search(r'"questions"\s*:\s*\[', text)
+        if not anchor:
+            return None
+
+        raw_objects = []
+        i, n = anchor.end(), len(text)
+        depth, start, in_str, escaped = 0, None, False, False
+
+        while i < n:
+            ch = text[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        raw_objects.append(text[start:i + 1])
+                        start = None
+            i += 1
+
+        questions = []
+        for raw in raw_objects:
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and "question_num" in obj:
+                questions.append(obj)
+
+        if not questions:
+            return None
+
+        def head_int(key):
+            mm = re.search(rf'"{key}"\s*:\s*(\d+)', text)
+            return int(mm.group(1)) if mm else None
+
+        total = head_int("total_questions") or len(questions)
+        correct = sum(1 for q in questions if q.get("is_correct"))
+        score = round(correct / total * 100, 1) if total else 0.0
+
+        return {
+            "total_questions": total,
+            "correct_count": correct,
+            "score": score,
+            "questions": questions,
+            "overall_comment": (
+                f"⚠️ 本次只批改了前 {len(questions)} 道题（共 {total} 道）："
+                "模型单次输出达到长度上限被截断。建议把作业分成几次上传，"
+                "或改用输出长度上限更大的模型。"
+            ),
+            "weak_points": [],
+            "truncated": True,
+        }
+
+    @staticmethod
+    def _describe_unparsable(raw: str, truncated_hint: bool) -> str:
+        """生成可诊断的解析失败说明（含首尾片段，便于判断问题类型）"""
+        stripped = raw.rstrip()
+        if truncated_hint:
+            reason = "模型输出达到长度上限被截断，JSON 不完整"
+        elif "{" not in raw:
+            reason = ("模型没有返回 JSON 格式的内容：可能该模型不支持图片输入，"
+                      "或图片不清晰无法识别。请确认所选模型支持视觉，或改用文字输入")
+        elif not stripped.endswith("}"):
+            reason = "模型输出在 JSON 中途结束（疑似被截断）"
+        else:
+            reason = "模型返回的 JSON 内容不合法"
+
+        head = stripped[:160].replace("\n", " ")
+        tail = stripped[-160:].replace("\n", " ")
+        return (f"{reason}；原始输出 {len(raw)} 字符。"
+                f"【开头】{head} … 【结尾】{tail}")
 
     async def grade_homework(self, image_paths: list[str], subject: str = "数学") -> AsyncGenerator[dict, None]:
         """
@@ -227,37 +422,44 @@ class LLMService:
         # Call LLM
         try:
             full_response = ""
-            stream = await self.client.chat.completions.create(
+            stream = await self._create_stream(
                 model=self.model,
                 messages=[{"role": "user", "content": content}],
                 stream=True,
-                max_tokens=8192
+                max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "32768"))
             )
 
             yielded_grading = False
+            finish_reason = None
             async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    text = chunk.choices[0].delta.content
-                    full_response += text
-                    yield {"type": "content", "data": text}
+                if chunk.choices:
+                    if chunk.choices[0].finish_reason:
+                        finish_reason = chunk.choices[0].finish_reason
+                    if chunk.choices[0].delta.content:
+                        text = chunk.choices[0].delta.content
+                        full_response += text
+                        yield {"type": "content", "data": text}
 
-                    # Update thinking status based on content
-                    if not yielded_grading and '"questions"' in full_response:
-                        yield {"type": "thinking", "data": {
-                            "step": "recognize",
-                            "message": "🔍 题目识别完成",
-                            "status": "done"
-                        }}
-                        yield {"type": "thinking", "data": {
-                            "step": "grading",
-                            "message": "📝 逐题批改中...",
-                            "status": "active"
-                        }}
-                        yielded_grading = True
+                        # Update thinking status based on content
+                        if not yielded_grading and '"questions"' in full_response:
+                            yield {"type": "thinking", "data": {
+                                "step": "recognize",
+                                "message": "🔍 题目识别完成",
+                                "status": "done"
+                            }}
+                            yield {"type": "thinking", "data": {
+                                "step": "grading",
+                                "message": "📝 逐题批改中...",
+                                "status": "active"
+                            }}
+                            yielded_grading = True
+
+            # finish_reason == "length" 说明模型输出被长度上限截断，JSON 必然不完整
+            truncated = finish_reason == "length"
 
             yield {"type": "thinking", "data": {
                 "step": "grading",
-                "message": "📝 批改完成",
+                "message": "📝 批改完成" + ("（输出被截断，仅保留已完成的题目）" if truncated else ""),
                 "status": "done"
             }}
 
@@ -277,7 +479,7 @@ class LLMService:
 
             # Parse result
             try:
-                result = self._parse_json_response(full_response)
+                result = self._parse_json_response(full_response, truncated_hint=truncated)
                 yield {"type": "thinking", "data": {
                     "step": "analyze",
                     "message": "🧠 错误分析完成",
@@ -289,8 +491,8 @@ class LLMService:
                     "status": "done"
                 }}
                 yield {"type": "result", "data": result}
-            except (json.JSONDecodeError, Exception):
-                yield {"type": "error", "data": f"无法解析批改结果，原始回复：{full_response[:500]}"}
+            except Exception as e:
+                yield {"type": "error", "data": f"批改结果解析失败：{e}（finish_reason={finish_reason}）"}
 
         except Exception as e:
             yield {"type": "error", "data": f"调用 LLM API 失败: {str(e)}"}
@@ -370,36 +572,42 @@ class LLMService:
         # Call LLM
         try:
             full_response = ""
-            stream = await self.client.chat.completions.create(
+            stream = await self._create_stream(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 stream=True,
-                max_tokens=8192
+                max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "32768"))
             )
 
             yielded_grading = False
+            finish_reason = None
             async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    text_chunk = chunk.choices[0].delta.content
-                    full_response += text_chunk
-                    yield {"type": "content", "data": text_chunk}
+                if chunk.choices:
+                    if chunk.choices[0].finish_reason:
+                        finish_reason = chunk.choices[0].finish_reason
+                    if chunk.choices[0].delta.content:
+                        text_chunk = chunk.choices[0].delta.content
+                        full_response += text_chunk
+                        yield {"type": "content", "data": text_chunk}
 
-                    if not yielded_grading and '"questions"' in full_response:
-                        yield {"type": "thinking", "data": {
-                            "step": "recognize",
-                            "message": "🔍 题目识别完成",
-                            "status": "done"
-                        }}
-                        yield {"type": "thinking", "data": {
-                            "step": "grading",
-                            "message": "📝 逐题批改中...",
-                            "status": "active"
-                        }}
-                        yielded_grading = True
+                        if not yielded_grading and '"questions"' in full_response:
+                            yield {"type": "thinking", "data": {
+                                "step": "recognize",
+                                "message": "🔍 题目识别完成",
+                                "status": "done"
+                            }}
+                            yield {"type": "thinking", "data": {
+                                "step": "grading",
+                                "message": "📝 逐题批改中...",
+                                "status": "active"
+                            }}
+                            yielded_grading = True
+
+            truncated = finish_reason == "length"
 
             yield {"type": "thinking", "data": {
                 "step": "grading",
-                "message": "📝 批改完成",
+                "message": "📝 批改完成" + ("（输出被截断，仅保留已完成的题目）" if truncated else ""),
                 "status": "done"
             }}
 
@@ -417,7 +625,7 @@ class LLMService:
 
             # Parse result
             try:
-                result = self._parse_json_response(full_response)
+                result = self._parse_json_response(full_response, truncated_hint=truncated)
                 yield {"type": "thinking", "data": {
                     "step": "analyze",
                     "message": "🧠 错误分析完成",
@@ -429,8 +637,8 @@ class LLMService:
                     "status": "done"
                 }}
                 yield {"type": "result", "data": result}
-            except (json.JSONDecodeError, Exception):
-                yield {"type": "error", "data": f"无法解析批改结果，原始回复：{full_response[:500]}"}
+            except Exception as e:
+                yield {"type": "error", "data": f"批改结果解析失败：{e}（finish_reason={finish_reason}）"}
 
         except Exception as e:
             yield {"type": "error", "data": f"调用 LLM API 失败: {str(e)}"}
@@ -555,33 +763,37 @@ class LLMService:
 
         try:
             full_response = ""
-            stream = await self.client.chat.completions.create(
+            stream = await self._create_stream(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 stream=True,
-                max_tokens=8192
+                max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "32768"))
             )
 
             yielded_generating = False
+            finish_reason = None
             async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    text = chunk.choices[0].delta.content
-                    full_response += text
-                    yield {"type": "content", "data": text}
+                if chunk.choices:
+                    if chunk.choices[0].finish_reason:
+                        finish_reason = chunk.choices[0].finish_reason
+                    if chunk.choices[0].delta.content:
+                        text = chunk.choices[0].delta.content
+                        full_response += text
+                        yield {"type": "content", "data": text}
 
-                    if not yielded_generating and '"questions"' in full_response:
-                        yield {"type": "thinking", "data": {"step": "design", "message": "🎯 题目设计完成", "status": "done"}}
-                        yield {"type": "thinking", "data": {"step": "generate", "message": "✍️ 正在生成练习题...", "status": "active"}}
-                        yielded_generating = True
+                        if not yielded_generating and '"questions"' in full_response:
+                            yield {"type": "thinking", "data": {"step": "design", "message": "🎯 题目设计完成", "status": "done"}}
+                            yield {"type": "thinking", "data": {"step": "generate", "message": "✍️ 正在生成练习题...", "status": "active"}}
+                            yielded_generating = True
 
             yield {"type": "thinking", "data": {"step": "generate", "message": "✍️ 练习题生成完成", "status": "done"}}
 
             # Parse result
             try:
-                result = self._parse_json_response(full_response)
+                result = self._parse_json_response(full_response, truncated_hint=(finish_reason == "length"))
                 yield {"type": "result", "data": result}
-            except (json.JSONDecodeError, Exception):
-                yield {"type": "error", "data": "无法解析生成结果"}
+            except Exception as e:
+                yield {"type": "error", "data": f"练习题生成结果解析失败：{e}（finish_reason={finish_reason}）"}
 
         except Exception as e:
             yield {"type": "error", "data": f"调用 LLM API 失败: {str(e)}"}

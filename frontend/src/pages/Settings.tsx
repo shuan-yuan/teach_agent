@@ -1,20 +1,27 @@
 import { useEffect, useState } from "react";
 import {
   Eye, EyeOff, Check, AlertTriangle, Loader2, Zap, Globe, Key, Cpu, Settings,
-  ShieldCheck, Search,
+  ShieldCheck, Search, Lock,
 } from "lucide-react";
 import { fetchConfig, saveConfig, testConfig, normalizeUrl, validateKey, fetchModels } from "../api/client";
 
+/**
+ * 快捷预设。
+ * vision 表示该模型是否支持图片输入——批改照片/扫描件依赖这个能力，纯文本模型会直接报错。
+ * 模型名会随厂商迭代变化，保存前请用「检测模型」按实际可用列表核对。
+ */
 const presets = [
-  { name: "通义千问（推荐）", endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen3.6-plus" },
-  { name: "DeepSeek",        endpoint: "https://api.deepseek.com/v1",                       model: "deepseek-chat" },
-  { name: "智谱清言",         endpoint: "https://open.bigmodel.cn/api/paas/v4",              model: "glm-5.1" },
-  { name: "Moonshot",        endpoint: "https://api.moonshot.cn/v1",                         model: "moonshot-v1-auto" },
+  { name: "通义千问", endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen3.6-plus",       vision: true,  hint: "支持图片输入，可拍照批改" },
+  { name: "DeepSeek", endpoint: "https://api.deepseek.com/v1",                       model: "deepseek-flash",     vision: true,  hint: "支持图片输入，可拍照批改" },
+  { name: "智谱清言",  endpoint: "https://open.bigmodel.cn/api/paas/v4",              model: "glm-5v-turbo",       vision: true,  hint: "视觉版；GLM-5 / GLM-5.1 是纯文本，读不了图" },
+  { name: "Moonshot", endpoint: "https://api.moonshot.cn/v1",                        model: "moonshot-v1-auto",   vision: false, hint: "纯文本系列，拍照请先确认型号支持图片" },
 ];
+
+const FALLBACK_SENTINEL = "__KEEP_EXISTING__";
 
 export default function SettingsPage() {
   const [endpoint, setEndpoint] = useState("");
-  const [apiKey, setApiKey]     = useState("");
+  const [apiKey, setApiKey]     = useState("");     // 只承载用户新输入的明文
   const [model, setModel]       = useState("");
   const [showKey, setShowKey]   = useState(false);
   const [configured, setConfigured] = useState(false);
@@ -22,30 +29,56 @@ export default function SettingsPage() {
   const [testing, setTesting]   = useState(false);
   const [toast, setToast]       = useState<{ ok: boolean; msg: string } | null>(null);
 
-  // Key validation state
+  // 服务端从不回传明文 Key，只给掩码 + 是否已存在
+  const [hasKey, setHasKey]           = useState(false);
+  const [keyMasked, setKeyMasked]     = useState("");
+  const [maskSentinel, setMaskSentinel] = useState(FALLBACK_SENTINEL);
+
   const [validatingKey, setValidatingKey] = useState(false);
   const [keyStatus, setKeyStatus] = useState<{ valid: boolean; message: string } | null>(null);
 
-  // Model detection state
   const [modelList, setModelList] = useState<{ id: string; name?: string }[]>([]);
   const [detectingModels, setDetectingModels] = useState(false);
   const [modelDetectMsg, setModelDetectMsg] = useState("");
 
   useEffect(() => {
     fetchConfig().then((c) => {
-      setEndpoint(c.endpoint ?? ""); setApiKey(c.api_key ?? ""); setModel(c.model_name ?? "");
+      setEndpoint(c.endpoint ?? "");
+      setModel(c.model_name ?? "");
+      setHasKey(c.has_api_key ?? false);
+      setKeyMasked(c.api_key_masked ?? "");
+      setMaskSentinel(c.mask_sentinel ?? FALLBACK_SENTINEL);
       setConfigured(c.is_configured ?? false);
     }).catch(() => {});
   }, []);
 
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 3500); };
 
+  /** 用户没改 Key 就传哨兵值，让后端沿用已保存的 Key */
+  const keyPayload = () => apiKey.trim() || (hasKey ? maskSentinel : "");
+
   const handleSave = async () => {
-    if (!endpoint || !apiKey || !model) { flash(false, "请填写完整"); return; }
+    if (!endpoint || !model) { flash(false, "请填写端点与模型名称"); return; }
+    const key = keyPayload();
+    if (!key) { flash(false, "请填写 API Key"); return; }
+
     setSaving(true);
-    try { const r = await saveConfig({ endpoint, api_key: apiKey, model_name: model }); setConfigured(true); flash(true, r.message); }
-    catch (e: any) { flash(false, e.message); }
-    finally { setSaving(false); }
+    try {
+      const r = await saveConfig({ endpoint, api_key: key, model_name: model });
+      setConfigured(true);
+      if (apiKey.trim()) {
+        setApiKey("");
+        setKeyMasked(apiKey.trim().length > 8
+          ? apiKey.trim().slice(0, 4) + "****" + apiKey.trim().slice(-4)
+          : "****");
+        setHasKey(true);
+      }
+      flash(true, r.message);
+    } catch (e: any) {
+      flash(false, e.message);
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleTest = async () => {
@@ -61,16 +94,17 @@ export default function SettingsPage() {
       const r = await normalizeUrl(endpoint);
       setEndpoint(r.url);
     } catch {
-      // silently ignore — user can still proceed
+      // 静默失败，用户仍可手动修改
     }
   };
 
   const handleValidateKey = async () => {
-    if (!endpoint || !apiKey) { flash(false, "请先填写 API 端点和密钥"); return; }
+    const key = keyPayload();
+    if (!endpoint || !key) { flash(false, "请先填写 API 端点和密钥"); return; }
     setValidatingKey(true);
     setKeyStatus(null);
     try {
-      const r = await validateKey(endpoint, apiKey);
+      const r = await validateKey(endpoint, key);
       setKeyStatus(r);
     } catch (e: any) {
       setKeyStatus({ valid: false, message: e.message || "验证失败" });
@@ -80,18 +114,16 @@ export default function SettingsPage() {
   };
 
   const handleDetectModels = async () => {
-    if (!endpoint || !apiKey) { flash(false, "请先填写 API 端点和密钥"); return; }
+    const key = keyPayload();
+    if (!endpoint || !key) { flash(false, "请先填写 API 端点和密钥"); return; }
     setDetectingModels(true);
     setModelDetectMsg("");
     try {
-      const r = await fetchModels(endpoint, apiKey);
+      const r = await fetchModels(endpoint, key);
       if (r.models && r.models.length > 0) {
         setModelList(r.models);
         setModelDetectMsg(`检测到 ${r.models.length} 个可用模型`);
-        // Auto-select the first model if current model is empty
-        if (!model) {
-          setModel(r.models[0].id);
-        }
+        if (!model) setModel(r.models[0].id);
       } else {
         setModelList([]);
         setModelDetectMsg(r.message || "未检测到可用模型，请手动输入");
@@ -118,8 +150,20 @@ export default function SettingsPage() {
         <p>快捷预设</p>
         <div className="preset-btns">
           {presets.map((p) => (
-            <button key={p.name} className="preset-btn" onClick={() => { setEndpoint(p.endpoint); setModel(p.model); setKeyStatus(null); setModelList([]); setModelDetectMsg(""); }}>{p.name}</button>
+            <button
+              key={p.name}
+              className="preset-btn"
+              title={p.hint}
+              onClick={() => { setEndpoint(p.endpoint); setModel(p.model); setKeyStatus(null); setModelList([]); setModelDetectMsg(""); }}
+            >
+              {p.name}
+              {p.vision ? "" : "（纯文本）"}
+            </button>
           ))}
+        </div>
+        <div className="config-tip" style={{ marginTop: 10 }}>
+          <p><strong>模型必须支持图片输入</strong>，否则上传照片或扫描件会直接报错。</p>
+          <p>纯文本模型只能用于「文字输入」标签和文字版 PDF。不确定时请点「检测模型」查看真实可用列表。</p>
         </div>
       </div>
 
@@ -150,11 +194,12 @@ export default function SettingsPage() {
                 type={showKey ? "text" : "password"}
                 value={apiKey}
                 onChange={e => { setApiKey(e.target.value); setKeyStatus(null); }}
-                placeholder="sk-..."
+                placeholder={hasKey ? `已保存：${keyMasked}（留空则沿用）` : "sk-..."}
                 style={{ paddingRight: 36 }}
               />
               <button
                 onClick={() => setShowKey(!showKey)}
+                aria-label={showKey ? "隐藏密钥" : "显示密钥"}
                 style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "var(--text-3)", cursor: "pointer" }}
               >
                 {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
@@ -164,6 +209,11 @@ export default function SettingsPage() {
               {validatingKey ? <Loader2 size={14} className="anim-spin" /> : <ShieldCheck size={14} />} 验证
             </button>
           </div>
+          {hasKey && !apiKey && (
+            <div className="config-tip" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <Lock size={12} /> 密钥仅保存在服务器，不会回传到浏览器。留空即表示沿用已保存的密钥。
+            </div>
+          )}
           {keyStatus && (
             <div className={`key-status ${keyStatus.valid ? "valid" : "invalid"}`}>
               {keyStatus.valid ? "✓" : "✗"} {keyStatus.message}
@@ -205,7 +255,6 @@ export default function SettingsPage() {
               {detectingModels ? <Loader2 size={14} className="anim-spin" /> : <Search size={14} />} 检测模型
             </button>
           </div>
-          {/* Manual input when model list is populated */}
           {modelList.length > 0 && (
             <input
               className="form-input"

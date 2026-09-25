@@ -29,8 +29,16 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
-body { font-family: 'LXGW WenKai', 'Nunito', sans-serif; background: var(--cream); color: var(--text-1); line-height: 1.6; }
-#root { display: flex; height: 100vh; overflow: hidden; }
+body {
+  /* 原为 Google Fonts 的「霞鹜文楷 / Nunito」外链，国内不可达且 <link> 会阻塞首屏渲染。
+     改为系统字体栈：装了霞鹜文楷就用，否则回落苹方 / 微软雅黑。 */
+  font-family: 'LXGW WenKai', -apple-system, BlinkMacSystemFont, 'PingFang SC',
+               'Hiragino Sans GB', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  background: var(--cream); color: var(--text-1); line-height: 1.6;
+}
+/* 100vh 在 iOS Safari 上会算进地址栏高度、顶出屏幕外；100dvh 是动态视口高度。
+   写成两行：不支持 dvh 的旧浏览器保留 vh，支持的用后者覆盖。 */
+#root { display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
 
 /* Scrollbar */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
@@ -845,4 +853,182 @@ body { font-family: 'LXGW WenKai', 'Nunito', sans-serif; background: var(--cream
   font-size: 11px;
   font-weight: 600;
   animation: fadeUp 0.3s ease;
+}
+
+/* ══════════════════════════════════════════
+   多用户 / 移动端 / PWA 补丁
+   ══════════════════════════════════════════ */
+
+/* ── 启动占位 ── */
+.app-boot {
+  flex: 1; width: 100%;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 14px; height: 100vh; height: 100dvh;
+  background: var(--cream); color: var(--text-3); font-size: 14px;
+}
+.app-boot-spinner {
+  width: 32px; height: 32px; border-radius: 50%;
+  border: 3px solid var(--border); border-top-color: var(--coral);
+  animation: boot-spin 0.8s linear infinite;
+}
+@keyframes boot-spin { to { transform: rotate(360deg); } }
+
+/* ── 主列 ── */
+.main-col { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+.mobile-header-user {
+  margin-left: auto; font-size: 12px; color: var(--text-3); max-width: 110px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ── 侧栏内层 ── */
+.sidebar-inner {
+  height: 100%; display: flex; flex-direction: column;
+  background: var(--sidebar-bg); color: #fff;
+  position: relative; overflow: hidden;
+}
+.sidebar-blob { position: absolute; border-radius: 50%; pointer-events: none; }
+.sidebar-blob-1 { top: -50px; right: -50px; width: 200px; height: 200px; background: rgba(255,255,255,0.08); }
+.sidebar-blob-2 { bottom: -30px; left: -30px; width: 120px; height: 120px; background: rgba(255,255,255,0.06); }
+.sidebar-close {
+  position: absolute; top: 18px; right: 14px; background: none; border: none;
+  color: rgba(255,255,255,0.65); cursor: pointer; padding: 8px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+}
+.sidebar-close:hover { background: rgba(255,255,255,0.12); }
+.sidebar-inner .sidebar-nav { flex: 1; overflow-y: auto; min-height: 0; }
+
+/* ── 当前用户 / 退出登录 ── */
+.sidebar-user {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px;
+  padding-bottom: calc(12px + env(safe-area-inset-bottom));
+  border-top: 1px solid rgba(255,255,255,0.14);
+  background: rgba(0,0,0,0.12);
+}
+.sidebar-user-avatar {
+  width: 34px; height: 34px; flex: 0 0 34px; border-radius: 50%;
+  background: rgba(255,255,255,0.22); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 15px;
+}
+.sidebar-user-info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.sidebar-user-info strong {
+  font-size: 13px; font-weight: 700; color: #fff;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sidebar-user-info span {
+  font-size: 11px; opacity: 0.7;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sidebar-logout {
+  flex: 0 0 38px; width: 38px; height: 38px; border-radius: 10px;
+  background: rgba(255,255,255,0.14); border: none; color: #fff; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.sidebar-logout:hover { background: rgba(255,255,255,0.26); }
+
+/* ── 登录 / 注册页 ── */
+.auth-page {
+  /* #root 是 flex 容器，作为 flex item 必须显式撑满，
+     否则宽度只等于内容宽度，右侧会露出一大块空白背景 */
+  flex: 1; width: 100%;
+  min-height: 100vh; min-height: 100dvh;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px 18px;
+  padding-bottom: calc(24px + env(safe-area-inset-bottom));
+  background: linear-gradient(160deg, #FFF3E0 0%, #FFFBF5 45%, #FFE8E8 100%);
+}
+.auth-card {
+  width: 100%; max-width: 410px; background: #fff;
+  border-radius: 22px; padding: 30px 26px 24px;
+  box-shadow: 0 12px 40px rgba(255,107,107,0.14);
+}
+.auth-brand { text-align: center; margin-bottom: 22px; }
+.auth-brand-icon {
+  width: 62px; height: 62px; margin: 0 auto 12px; border-radius: 18px;
+  background: var(--sidebar-bg); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 6px 20px rgba(255,107,107,0.32);
+}
+.auth-brand h1 { font-size: 21px; font-weight: 700; color: var(--text-1); }
+.auth-brand p { font-size: 12.5px; color: var(--text-3); margin-top: 3px; }
+.auth-tabs {
+  display: flex; background: var(--warm-gray);
+  border-radius: 12px; padding: 4px; margin-bottom: 20px;
+}
+.auth-tab {
+  flex: 1; min-height: 44px; border: none; background: none; border-radius: 9px;
+  font-size: 14px; font-weight: 600; color: var(--text-2);
+  cursor: pointer; font-family: inherit; transition: all 0.18s;
+}
+.auth-tab.active { background: #fff; color: var(--coral); box-shadow: 0 2px 8px rgba(0,0,0,0.07); }
+.auth-form { display: flex; flex-direction: column; gap: 14px; }
+.auth-field { display: flex; flex-direction: column; gap: 6px; }
+.auth-field label { font-size: 12.5px; font-weight: 600; color: var(--text-2); }
+.auth-input {
+  width: 100%; min-height: 48px; padding: 12px 14px;
+  border: 1.5px solid var(--border); border-radius: 12px;
+  font-size: 16px; /* 不能小于 16px，否则 iOS 聚焦时会放大整页 */
+  font-family: inherit; color: var(--text-1); background: #fff;
+  transition: border-color 0.16s;
+}
+.auth-input:focus { outline: none; border-color: var(--coral); box-shadow: 0 0 0 3px var(--coral-light); }
+.auth-error {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: #D64545; background: var(--coral-light);
+  border-radius: 10px; padding: 10px 12px;
+}
+.auth-submit {
+  min-height: 50px; margin-top: 4px; border: none; border-radius: 12px; cursor: pointer;
+  background: var(--sidebar-bg); color: #fff; font-size: 15px; font-weight: 700;
+  font-family: inherit; display: flex; align-items: center; justify-content: center; gap: 8px;
+  box-shadow: 0 6px 18px rgba(255,107,107,0.3);
+  transition: transform 0.14s, opacity 0.14s;
+}
+.auth-submit:active { transform: scale(0.985); }
+.auth-submit:disabled { opacity: 0.65; cursor: default; }
+.auth-note {
+  display: flex; align-items: center; gap: 6px; margin-top: 14px;
+  font-size: 12px; color: var(--teal); background: var(--teal-light);
+  border-radius: 10px; padding: 9px 12px;
+}
+.auth-foot { margin-top: 16px; text-align: center; }
+.auth-foot p { font-size: 11.5px; color: var(--text-3); }
+
+/* ══════════════════════════════════════════
+   移动端 / 平板硬性补丁
+   ══════════════════════════════════════════ */
+
+@media (max-width: 1023px) {
+  .sidebar { display: none; }
+  .mobile-header {
+    display: flex; height: auto; min-height: 52px;
+    padding-top: env(safe-area-inset-top);
+  }
+  .mobile-header button {
+    min-width: 44px; min-height: 44px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .main-content { padding-bottom: env(safe-area-inset-bottom); }
+
+  /* 触控目标统一放大到 44px 以上 */
+  button, .btn-primary, .btn-secondary, .upload-tab, .preset-btn, .sidebar-nav a {
+    min-height: 44px;
+  }
+  .preset-btn, .upload-tab { display: flex; align-items: center; justify-content: center; }
+
+  /* 表格一律横向滚动，窄屏上挤成一团没法读 */
+  table { display: block; width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table-wrap, .data-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* 抽屉别占满整屏，留出点击背板关闭的空间 */
+  .mobile-overlay .drawer { width: min(78vw, 300px); }
+}
+
+/* 所有输入控件字号 ≥16px，避免 iOS 聚焦时整页缩放 */
+input, textarea, select { font-size: 16px; }
+
+@media (max-width: 639px) {
+  .auth-card { padding: 24px 18px 20px; border-radius: 18px; }
+  .mobile-header-user { max-width: 80px; }
 }

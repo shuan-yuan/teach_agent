@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- viewport-fit=cover: 让 env(safe-area-inset-*) 生效，适配 iPad/iPhone 圆角与横条 -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#FF6B6B" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="教育智能体" />
+    <meta name="format-detection" content="telephone=no" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <title>教育智能体 · 智能作业批改系统</title>
+    <!--
+      原实现从 Google Fonts 引入「霞鹜文楷」。国内网络基本无法访问，
+      而 <link rel="stylesheet"> 会阻塞渲染直到超时，首屏会白屏数秒。
+      因此改为使用系统字体栈（见 index.css 的 --font-ui / --font-hand）。
+    -->
+    <script type="module" crossorigin src="/assets/index-B7gVwZdU.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-nugd45hu.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

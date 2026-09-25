@@ -1,14 +1,29 @@
 // ============================================================
+// Auth
+// ============================================================
+
+export interface AuthUser {
+  id: number;
+  username: string;
+  display_name: string;
+  is_admin: boolean;
+}
+
+// ============================================================
 // API Configuration
 // ============================================================
 
+/**
+ * 注意：完整 API Key 永远不下发到前端，只返回掩码。
+ * 保存时若用户没改 Key，回传 `mask_sentinel` 表示保留服务器上的原值。
+ */
 export interface ApiConfig {
-  id: number;
   endpoint: string;
-  api_key: string;
-  api_key_masked: string;
   model_name: string;
+  api_key_masked: string;
+  has_api_key: boolean;
   is_configured: boolean;
+  mask_sentinel: string;
 }
 
 // ============================================================
@@ -54,6 +69,8 @@ export interface GradingResult {
   questions: QuestionResult[];
   overall_comment: string;
   weak_points: string[];
+  /** 模型输出被长度上限截断，结果只包含已完成的题目 */
+  truncated?: boolean;
 }
 
 export interface QuestionResult {

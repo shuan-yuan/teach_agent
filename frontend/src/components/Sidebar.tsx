@@ -1,8 +1,9 @@
 import { NavLink } from "react-router-dom";
 import {
   LayoutDashboard, Settings, Users, PenLine, BookX, Target,
-  GraduationCap, X,
+  GraduationCap, X, LogOut,
 } from "lucide-react";
+import type { AuthUser } from "../types";
 
 const mainNav = [
   { to: "/",         icon: LayoutDashboard, label: "工作台",   end: true },
@@ -16,12 +17,22 @@ const bottomNav = [
   { to: "/settings", icon: Settings, label: "API 配置" },
 ];
 
-export default function Sidebar({ onClose }: { onClose?: () => void }) {
+export default function Sidebar({
+  user,
+  onLogout,
+  onClose,
+}: {
+  user?: AuthUser;
+  onLogout?: () => void;
+  onClose?: () => void;
+}) {
+  const initial = (user?.display_name || user?.username || "?").trim().charAt(0).toUpperCase();
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--sidebar-bg)", color: "white", position: "relative", overflow: "hidden" }}>
-      {/* Decorative circles — same as prototype ::before / ::after */}
-      <div style={{ position: "absolute", top: -50, right: -50, width: 200, height: 200, borderRadius: "50%", background: "rgba(255,255,255,0.08)", pointerEvents: "none" }} />
-      <div style={{ position: "absolute", bottom: -30, left: -30, width: 120, height: 120, borderRadius: "50%", background: "rgba(255,255,255,0.06)", pointerEvents: "none" }} />
+    <div className="sidebar-inner">
+      {/* Decorative circles */}
+      <div className="sidebar-blob sidebar-blob-1" />
+      <div className="sidebar-blob sidebar-blob-2" />
 
       {/* Brand */}
       <div className="brand">
@@ -31,8 +42,7 @@ export default function Sidebar({ onClose }: { onClose?: () => void }) {
         <h1>教育智能体</h1>
         <p>智能作业批改系统</p>
         {onClose && (
-          <button onClick={onClose}
-            style={{ position: "absolute", top: 20, right: 16, background: "none", border: "none", color: "rgba(255,255,255,0.6)", cursor: "pointer", padding: 4, borderRadius: 8 }}>
+          <button className="sidebar-close" onClick={onClose} aria-label="关闭菜单">
             <X size={16} />
           </button>
         )}
@@ -48,23 +58,21 @@ export default function Sidebar({ onClose }: { onClose?: () => void }) {
             to={item.to}
             end={item.end}
             onClick={onClose}
-            className={({ isActive }) => isActive ? "active" : ""}
+            className={({ isActive }) => (isActive ? "active" : "")}
           >
             <item.icon size={20} style={{ opacity: 0.85 }} />
             {item.label}
           </NavLink>
         ))}
 
-        {/* Divider */}
         <div className="sidebar-nav-divider" />
 
-        {/* Bottom Navigation — API 配置 */}
         {bottomNav.map((item) => (
           <NavLink
             key={item.to}
             to={item.to}
             onClick={onClose}
-            className={({ isActive }) => isActive ? "active" : ""}
+            className={({ isActive }) => (isActive ? "active" : "")}
           >
             <item.icon size={20} style={{ opacity: 0.85 }} />
             {item.label}
@@ -72,11 +80,21 @@ export default function Sidebar({ onClose }: { onClose?: () => void }) {
         ))}
       </nav>
 
-      {/* Footer */}
-      <div className="sidebar-footer">
-        <span>v1.0</span>
-        <span><span className="status-dot" />运行正常</span>
-      </div>
+      {/* Current user + logout */}
+      {user && (
+        <div className="sidebar-user">
+          <div className="sidebar-user-avatar">{initial}</div>
+          <div className="sidebar-user-info">
+            <strong>{user.display_name}</strong>
+            <span>@{user.username}</span>
+          </div>
+          {onLogout && (
+            <button className="sidebar-logout" onClick={onLogout} title="退出登录">
+              <LogOut size={16} />
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

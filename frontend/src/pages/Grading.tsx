@@ -14,6 +14,51 @@ interface TStep { step: string; message: string; status: string; detail?: string
 
 const ACCEPT_TYPES = "image/*,.pdf,.docx,.doc,.txt";
 function isImage(file: File): boolean { return file.type.startsWith("image/"); }
+
+/**
+ * 压缩图片后再上传。
+ *
+ * iPad / 手机拍出来的作业照片通常 3-5MB，原实现直接 base64 塞进 messages，
+ * 连传几张就会撞上模型的请求体积上限，表现为「批改失败」。
+ * 长边压到 1600px、JPEG 质量 0.82，作业文字依然清晰可辨。
+ */
+async function compressImage(file: File, maxSide = 1600, quality = 0.82): Promise<File> {
+  if (!isImage(file)) return file;
+  if (file.size <= 800 * 1024) return file; // 本来就不大，没必要重新编码
+
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const el = new Image();
+      el.onload = () => { URL.revokeObjectURL(url); resolve(el); };
+      el.onerror = () => { URL.revokeObjectURL(url); reject(new Error("decode failed")); };
+      el.src = url;
+    });
+
+    const scale = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * scale));
+    const h = Math.max(1, Math.round(img.naturalHeight * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return file;
+
+    // 铺白底：PNG 的透明区域转成 JPEG 会变黑
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+
+    const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, "image/jpeg", quality));
+    if (!blob || blob.size >= file.size) return file;
+
+    const name = file.name.replace(/\.[^.]+$/, "") + ".jpg";
+    return new File([blob], name, { type: "image/jpeg", lastModified: Date.now() });
+  } catch {
+    return file; // 压缩失败就退回原图，不能因此挡住用户
+  }
+}
 function fileIcon(file: File) {
   const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "pdf") return <FileText size={28} style={{ color: "var(--coral)" }} />;
@@ -73,7 +118,19 @@ function startGradingSession(homeworkId: number, studentName: string, onHistoryR
       } else if (d.type === "error") {
         session.error = String(d.data);
         session.phase = "done";
+      } else if (d.type === "failed") {
+        // 只作为「服务端已收尾」的终止信号。
+        // 若前面已经给出具体错误，绝不能覆盖它（否则用户只看到一个笼统提示）。
+        if (!session.error) {
+          const reasonMap: Record<string, string> = {
+            no_result: "模型没有返回可用的批改结果，请重试或更换模型",
+            save_failed: "批改结果保存失败，请重试",
+          };
+          session.error = reasonMap[d.data?.reason] ?? "批改失败，请重试";
+        }
+        session.phase = "done";
       } else if (d.type === "done") {
+        session.phase = "done";
         es.close();
         activeES = null;
         onHistoryReload();
@@ -86,8 +143,10 @@ function startGradingSession(homeworkId: number, studentName: string, onHistoryR
   es.onerror = () => {
     es.close();
     activeES = null;
-    if (!session.result) {
-      session.error = "连接中断";
+    // 只有「会话尚未收尾」才算真正断线。
+    // 原先用 !session.result 判断，会把服务端发回的具体错误覆盖成「连接中断」。
+    if (session.phase !== "done") {
+      session.error = "连接中断（未收到批改结果，可能网络中断或服务端超时；重试即可，已保存的作业不会重复计费）";
       session.phase = "done";
       syncToReact?.();
     }
@@ -215,16 +274,27 @@ export default function GradingPage() {
     return () => document.removeEventListener("paste", handlePaste);
   }, [handlePaste]);
 
-  const addFilesFromList = (fl: File[] | FileList) => {
+  const addFilesFromList = async (fl: File[] | FileList) => {
     const arr = Array.from(fl);
-    setFiles(p => [...p, ...arr]);
-    arr.forEach(f => {
-      if (isImage(f)) {
-        const r = new FileReader();
-        r.onload = e => setPreviews(p => [...p, e.target?.result as string]);
-        r.readAsDataURL(f);
-      } else { setPreviews(p => [...p, null]); }
-    });
+    // 拍照原图先压缩，避免多张连传时超出模型请求体积限制
+    const processed = await Promise.all(arr.map((f) => compressImage(f)));
+    setFiles(p => [...p, ...processed]);
+
+    // 一次性、按顺序生成预览。
+    // 原实现用 forEach + FileReader 回调逐个 append，完成顺序不确定，
+    // 预览图会与文件顺序错位。
+    const newPreviews = await Promise.all(
+      processed.map((f) => {
+        if (!isImage(f)) return Promise.resolve(null);
+        return new Promise<string | null>((res) => {
+          const r = new FileReader();
+          r.onload = (e) => res((e.target?.result as string) ?? null);
+          r.onerror = () => res(null);
+          r.readAsDataURL(f);
+        });
+      }),
+    );
+    setPreviews(p => [...p, ...newPreviews]);
   };
   const rmFile = (i: number) => { setFiles(p => p.filter((_, j) => j !== i)); setPreviews(p => p.filter((_, j) => j !== i)); };
   const onDrop = (e: DragEvent) => { e.preventDefault(); setDrag(false); addFilesFromList(e.dataTransfer.files); };
@@ -480,6 +550,23 @@ export default function GradingPage() {
                 </div>
                 {result.overall_comment && <div className="result-comment">{result.overall_comment}</div>}
               </div>
+
+              {result.truncated && (
+                <div
+                  style={{
+                    display: "flex", gap: 8, alignItems: "flex-start",
+                    margin: "12px 0", padding: "10px 12px",
+                    background: "#fff7e6", border: "1px solid #ffd591",
+                    borderRadius: 8, fontSize: 13, color: "#8c5a00", lineHeight: 1.6,
+                  }}
+                >
+                  <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 2 }} />
+                  <span>
+                    题目较多，模型单次输出达到长度上限被截断，本页只包含已完成的 {result.questions?.length ?? 0} 道题。
+                    建议把作业分成两次上传，或换用输出上限更大的模型。
+                  </span>
+                </div>
+              )}
 
               {result.questions?.map(q => <QCard key={q.question_num} q={q} />)}
 

@@ -1,28 +1,58 @@
 """
-数据库模块 - SQLite 数据库初始化和操作
+数据库模块 - SQLite 数据库初始化和操作（多用户版）
+
+数据隔离设计：
+- users 是账号根表
+- students 通过 user_id 挂载到用户，是每个用户的数据根表
+- homework_submissions / error_records / practice_sheets 都通过 student_id
+  关联到 students，所以只要在 students 上做 user_id 过滤，
+  这些表就自动被隔离（查询一律 JOIN students 做越权校验）
 """
 import aiosqlite
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "edu_agent.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "edu_agent.db")
+
+SESSION_DAYS = 30
 
 
 async def init_db():
     """初始化数据库表结构"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript('''
-            CREATE TABLE IF NOT EXISTS api_config (
-                id INTEGER PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            -- 每个用户独立的 API 配置（各自的 Key，互不消耗对方额度）
+            CREATE TABLE IF NOT EXISTS user_api_config (
+                user_id INTEGER PRIMARY KEY,
                 endpoint TEXT NOT NULL DEFAULT '',
                 api_key TEXT NOT NULL DEFAULT '',
                 model_name TEXT NOT NULL DEFAULT '',
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS students (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 1,
                 name TEXT NOT NULL,
                 grade TEXT NOT NULL DEFAULT '',
                 class_name TEXT NOT NULL DEFAULT '',
@@ -42,6 +72,8 @@ async def init_db():
                 total_questions INTEGER DEFAULT 0,
                 correct_count INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'pending',
+                file_type TEXT DEFAULT 'image',
+                content_text TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
             );
@@ -75,28 +107,25 @@ async def init_db():
                 FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
             );
 
-            -- Insert default config if not exists
-            INSERT OR IGNORE INTO api_config (id, endpoint, api_key, model_name)
-            VALUES (1, '', '', '');
+            CREATE INDEX IF NOT EXISTS idx_students_user ON students(user_id);
+            CREATE INDEX IF NOT EXISTS idx_homework_student ON homework_submissions(student_id);
+            CREATE INDEX IF NOT EXISTS idx_errors_student ON error_records(student_id);
+            CREATE INDEX IF NOT EXISTS idx_practice_student ON practice_sheets(student_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         ''')
         await db.commit()
 
-        # 升级 homework_submissions 表：添加新字段（兼容旧数据库）
-        try:
-            await db.execute(
-                "ALTER TABLE homework_submissions ADD COLUMN file_type TEXT DEFAULT 'image'"
-            )
-            await db.commit()
-        except Exception:
-            pass  # 列已存在，忽略
-
-        try:
-            await db.execute(
-                "ALTER TABLE homework_submissions ADD COLUMN content_text TEXT DEFAULT ''"
-            )
-            await db.commit()
-        except Exception:
-            pass  # 列已存在，忽略
+        # ── 兼容旧库迁移 ──
+        for stmt in (
+            "ALTER TABLE students ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE homework_submissions ADD COLUMN file_type TEXT DEFAULT 'image'",
+            "ALTER TABLE homework_submissions ADD COLUMN content_text TEXT DEFAULT ''",
+        ):
+            try:
+                await db.execute(stmt)
+                await db.commit()
+            except Exception:
+                pass  # 列已存在
 
 
 async def get_db():
@@ -106,27 +135,120 @@ async def get_db():
     return db
 
 
-# ============ API Config Operations ============
+# ============ User & Session Operations ============
 
-async def get_config():
+async def count_users() -> int:
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT * FROM api_config WHERE id = 1")
-        row = await cursor.fetchone()
-        if row:
-            return dict(row)
-        return {"id": 1, "endpoint": "", "api_key": "", "model_name": ""}
+        cursor = await db.execute("SELECT COUNT(*) as c FROM users")
+        return (await cursor.fetchone())['c']
     finally:
         await db.close()
 
 
-async def save_config(endpoint: str, api_key: str, model_name: str):
+async def create_user(username: str, password_hash: str, display_name: str = "",
+                      is_admin: bool = False) -> int:
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO users (username, password_hash, display_name, is_admin) VALUES (?, ?, ?, ?)",
+            (username, password_hash, display_name or username, 1 if is_admin else 0)
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def get_user_by_username(username: str):
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT * FROM users WHERE username = ?", (username,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await db.close()
+
+
+async def get_user_by_id(user_id: int):
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await db.close()
+
+
+async def create_session(token: str, user_id: int):
+    db = await get_db()
+    try:
+        expires = (datetime.now() + timedelta(days=SESSION_DAYS)).isoformat()
+        await db.execute(
+            "INSERT OR REPLACE INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
+            (token, user_id, expires)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_session_user(token: str):
+    """用 session token 换用户信息，过期/不存在返回 None"""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """SELECT u.* FROM sessions s
+               JOIN users u ON s.user_id = u.id
+               WHERE s.token = ? AND s.expires_at > ?""",
+            (token, datetime.now().isoformat())
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await db.close()
+
+
+async def delete_session(token: str):
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def purge_expired_sessions():
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM sessions WHERE expires_at <= ?", (datetime.now().isoformat(),))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+# ============ Per-user API Config ============
+
+async def get_config(user_id: int):
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT * FROM user_api_config WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if row:
+            return dict(row)
+        return {"user_id": user_id, "endpoint": "", "api_key": "", "model_name": ""}
+    finally:
+        await db.close()
+
+
+async def save_config(user_id: int, endpoint: str, api_key: str, model_name: str):
     db = await get_db()
     try:
         await db.execute(
-            """INSERT OR REPLACE INTO api_config (id, endpoint, api_key, model_name, updated_at)
-               VALUES (1, ?, ?, ?, ?)""",
-            (endpoint, api_key, model_name, datetime.now().isoformat())
+            """INSERT OR REPLACE INTO user_api_config
+               (user_id, endpoint, api_key, model_name, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (user_id, endpoint, api_key, model_name, datetime.now().isoformat())
         )
         await db.commit()
     finally:
@@ -135,15 +257,17 @@ async def save_config(endpoint: str, api_key: str, model_name: str):
 
 # ============ Student Operations ============
 
-async def get_students():
+async def get_students(user_id: int):
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT * FROM students ORDER BY created_at DESC")
+        cursor = await db.execute(
+            "SELECT * FROM students WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,)
+        )
         rows = await cursor.fetchall()
         students = []
         for row in rows:
             s = dict(row)
-            # Get stats
             cursor2 = await db.execute(
                 "SELECT COUNT(*) as count, COALESCE(AVG(score), 0) as avg_score FROM homework_submissions WHERE student_id = ?",
                 (s['id'],)
@@ -156,23 +280,22 @@ async def get_students():
                 "SELECT COUNT(*) as count FROM error_records WHERE student_id = ?",
                 (s['id'],)
             )
-            err_stats = dict(await cursor3.fetchone())
-            s['error_count'] = err_stats['count']
+            s['error_count'] = (await cursor3.fetchone())['count']
             students.append(s)
         return students
     finally:
         await db.close()
 
 
-async def create_student(name: str, grade: str, class_name: str, subject: str = "数学"):
+async def create_student(user_id: int, name: str, grade: str, class_name: str, subject: str = "数学"):
     import random
     colors = ['#4F46E5', '#7C3AED', '#EC4899', '#EF4444', '#F97316', '#EAB308', '#22C55E', '#06B6D4', '#3B82F6']
     color = random.choice(colors)
     db = await get_db()
     try:
         cursor = await db.execute(
-            "INSERT INTO students (name, grade, class_name, subject, avatar_color) VALUES (?, ?, ?, ?, ?)",
-            (name, grade, class_name, subject, color)
+            "INSERT INTO students (user_id, name, grade, class_name, subject, avatar_color) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, name, grade, class_name, subject, color)
         )
         await db.commit()
         return cursor.lastrowid
@@ -180,73 +303,85 @@ async def create_student(name: str, grade: str, class_name: str, subject: str = 
         await db.close()
 
 
-async def update_student(student_id: int, name: str, grade: str, class_name: str, subject: str = "数学"):
+async def update_student(user_id: int, student_id: int, name: str, grade: str,
+                         class_name: str, subject: str = "数学") -> bool:
+    """更新学生 — 带 user_id 校验，越权返回 False"""
     db = await get_db()
     try:
-        await db.execute(
-            "UPDATE students SET name=?, grade=?, class_name=?, subject=? WHERE id=?",
-            (name, grade, class_name, subject, student_id)
+        cursor = await db.execute(
+            "UPDATE students SET name=?, grade=?, class_name=?, subject=? WHERE id=? AND user_id=?",
+            (name, grade, class_name, subject, student_id, user_id)
         )
         await db.commit()
+        return cursor.rowcount > 0
     finally:
         await db.close()
 
 
-async def delete_student(student_id: int):
+async def delete_student(user_id: int, student_id: int) -> bool:
+    """删除学生及其关联数据 — 带 user_id 校验"""
     db = await get_db()
     try:
+        cursor = await db.execute(
+            "SELECT id FROM students WHERE id=? AND user_id=?", (student_id, user_id)
+        )
+        if not await cursor.fetchone():
+            return False
         await db.execute("DELETE FROM error_records WHERE student_id=?", (student_id,))
         await db.execute("DELETE FROM homework_submissions WHERE student_id=?", (student_id,))
         await db.execute("DELETE FROM practice_sheets WHERE student_id=?", (student_id,))
-        await db.execute("DELETE FROM students WHERE id=?", (student_id,))
+        await db.execute("DELETE FROM students WHERE id=? AND user_id=?", (student_id, user_id))
         await db.commit()
+        return True
     finally:
         await db.close()
 
 
-async def get_student(student_id: int):
+async def get_student(user_id: int, student_id: int):
+    """获取学生 — 带 user_id 校验"""
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT * FROM students WHERE id = ?", (student_id,))
+        cursor = await db.execute(
+            "SELECT * FROM students WHERE id = ? AND user_id = ?", (student_id, user_id)
+        )
         row = await cursor.fetchone()
-        if row:
-            return dict(row)
-        return None
+        return dict(row) if row else None
     finally:
         await db.close()
 
 
 # ============ Homework Operations ============
 
-async def delete_homework(homework_id: int):
-    """删除作业记录及其关联的错题"""
-    db = await get_db()
-    try:
-        await db.execute("DELETE FROM error_records WHERE homework_id=?", (homework_id,))
-        await db.execute("DELETE FROM homework_submissions WHERE id=?", (homework_id,))
-        await db.commit()
-    finally:
-        await db.close()
-
-
-async def create_homework(student_id: int, subject: str, image_paths: list):
+async def delete_homework(user_id: int, homework_id: int) -> bool:
+    """删除作业记录及其关联的错题 — 带 user_id 校验"""
     db = await get_db()
     try:
         cursor = await db.execute(
-            "INSERT INTO homework_submissions (student_id, subject, image_paths, status) VALUES (?, ?, ?, 'pending')",
-            (student_id, subject, json.dumps(image_paths))
+            """SELECT h.id FROM homework_submissions h
+               JOIN students s ON h.student_id = s.id
+               WHERE h.id = ? AND s.user_id = ?""",
+            (homework_id, user_id)
         )
+        if not await cursor.fetchone():
+            return False
+        await db.execute("DELETE FROM error_records WHERE homework_id=?", (homework_id,))
+        await db.execute("DELETE FROM homework_submissions WHERE id=?", (homework_id,))
         await db.commit()
-        return cursor.lastrowid
+        return True
     finally:
         await db.close()
 
 
-async def create_homework_v2(student_id: int, subject: str, file_paths: list,
+async def create_homework_v2(user_id: int, student_id: int, subject: str, file_paths: list,
                              file_type: str = "image", content_text: str = ""):
-    """创建作业记录 - 支持新字段 file_type 和 content_text"""
+    """创建作业记录 — 校验学生归属"""
     db = await get_db()
     try:
+        cursor = await db.execute(
+            "SELECT id FROM students WHERE id = ? AND user_id = ?", (student_id, user_id)
+        )
+        if not await cursor.fetchone():
+            return None
         cursor = await db.execute(
             """INSERT INTO homework_submissions
                (student_id, subject, image_paths, file_type, content_text, status)
@@ -274,45 +409,39 @@ async def update_homework_result(homework_id: int, grading_result: str, thinking
         await db.close()
 
 
-async def get_homework_list(student_id: int = None):
+async def get_homework_list(user_id: int, student_id: int = None):
+    """作业列表 — 只返回当前用户的学生作业"""
     db = await get_db()
     try:
+        sql = """SELECT h.*, s.name as student_name
+                 FROM homework_submissions h
+                 JOIN students s ON h.student_id = s.id
+                 WHERE s.user_id = ?"""
+        params = [user_id]
         if student_id:
-            cursor = await db.execute(
-                """SELECT h.*, s.name as student_name
-                   FROM homework_submissions h
-                   JOIN students s ON h.student_id = s.id
-                   WHERE h.student_id = ?
-                   ORDER BY h.created_at DESC""",
-                (student_id,)
-            )
-        else:
-            cursor = await db.execute(
-                """SELECT h.*, s.name as student_name
-                   FROM homework_submissions h
-                   JOIN students s ON h.student_id = s.id
-                   ORDER BY h.created_at DESC"""
-            )
+            sql += " AND h.student_id = ?"
+            params.append(student_id)
+        sql += " ORDER BY h.created_at DESC"
+        cursor = await db.execute(sql, params)
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
     finally:
         await db.close()
 
 
-async def get_homework(homework_id: int):
+async def get_homework(user_id: int, homework_id: int):
+    """作业详情 — 带 user_id 校验（含 file_type/content_text，批改时要用）"""
     db = await get_db()
     try:
         cursor = await db.execute(
             """SELECT h.*, s.name as student_name
                FROM homework_submissions h
                JOIN students s ON h.student_id = s.id
-               WHERE h.id = ?""",
-            (homework_id,)
+               WHERE h.id = ? AND s.user_id = ?""",
+            (homework_id, user_id)
         )
         row = await cursor.fetchone()
-        if row:
-            return dict(row)
-        return None
+        return dict(row) if row else None
     finally:
         await db.close()
 
@@ -339,16 +468,18 @@ async def create_error_records(student_id: int, homework_id: int, errors: list):
         await db.close()
 
 
-async def get_error_records(student_id: int):
+async def get_error_records(user_id: int, student_id: int):
+    """错题记录 — 带 user_id 校验"""
     db = await get_db()
     try:
         cursor = await db.execute(
             """SELECT e.*, h.subject, h.created_at as homework_date
                FROM error_records e
                JOIN homework_submissions h ON e.homework_id = h.id
-               WHERE e.student_id = ?
+               JOIN students s ON e.student_id = s.id
+               WHERE e.student_id = ? AND s.user_id = ?
                ORDER BY e.created_at DESC""",
-            (student_id,)
+            (student_id, user_id)
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
@@ -356,11 +487,16 @@ async def get_error_records(student_id: int):
         await db.close()
 
 
-async def get_error_stats(student_id: int):
-    """获取学生错题统计"""
+async def get_error_stats(user_id: int, student_id: int):
+    """获取学生错题统计 — 带 user_id 校验"""
     db = await get_db()
     try:
-        # 按知识点统计
+        owned = await db.execute(
+            "SELECT id FROM students WHERE id = ? AND user_id = ?", (student_id, user_id)
+        )
+        if not await owned.fetchone():
+            return {"by_knowledge_point": [], "by_error_type": [], "by_difficulty": []}
+
         cursor = await db.execute(
             """SELECT knowledge_point, COUNT(*) as count
                FROM error_records WHERE student_id = ? AND knowledge_point != ''
@@ -369,7 +505,6 @@ async def get_error_stats(student_id: int):
         )
         by_knowledge = [dict(row) for row in await cursor.fetchall()]
 
-        # 按错误类型统计
         cursor = await db.execute(
             """SELECT error_type, COUNT(*) as count
                FROM error_records WHERE student_id = ? AND error_type != ''
@@ -378,7 +513,6 @@ async def get_error_stats(student_id: int):
         )
         by_error_type = [dict(row) for row in await cursor.fetchall()]
 
-        # 按难度统计
         cursor = await db.execute(
             """SELECT difficulty, COUNT(*) as count
                FROM error_records WHERE student_id = ?
@@ -398,31 +532,18 @@ async def get_error_stats(student_id: int):
 
 # ============ Student Profile ============
 
-async def get_student_profile(student_id: int) -> dict:
-    """
-    获取学生完整数据画像
-
-    Returns:
-        {
-            "basic_info": {...},
-            "total_homeworks": int,
-            "avg_score": float,
-            "recent_scores": [最近5次得分],
-            "error_knowledge_distribution": [{knowledge_point, count}],
-            "error_type_distribution": [{error_type, count}],
-            "practice_count": int
-        }
-    """
+async def get_student_profile(user_id: int, student_id: int) -> dict:
+    """获取学生完整数据画像 — 带 user_id 校验"""
     db = await get_db()
     try:
-        # 基本信息
-        cursor = await db.execute("SELECT * FROM students WHERE id = ?", (student_id,))
+        cursor = await db.execute(
+            "SELECT * FROM students WHERE id = ? AND user_id = ?", (student_id, user_id)
+        )
         student_row = await cursor.fetchone()
         if not student_row:
             return {}
         basic_info = dict(student_row)
 
-        # 总作业数 & 平均分
         cursor = await db.execute(
             """SELECT COUNT(*) as total,
                       COALESCE(AVG(CASE WHEN status='completed' THEN score END), 0) as avg_score
@@ -430,10 +551,7 @@ async def get_student_profile(student_id: int) -> dict:
             (student_id,)
         )
         hw_stats = dict(await cursor.fetchone())
-        total_homeworks = hw_stats['total']
-        avg_score = round(hw_stats['avg_score'], 1)
 
-        # 最近5次得分趋势
         cursor = await db.execute(
             """SELECT score, created_at FROM homework_submissions
                WHERE student_id = ? AND status = 'completed'
@@ -442,10 +560,8 @@ async def get_student_profile(student_id: int) -> dict:
         )
         recent_rows = await cursor.fetchall()
         recent_scores = [{"score": dict(r)['score'], "date": dict(r)['created_at']} for r in recent_rows]
-        # 反转使其按时间正序（从旧到新）
         recent_scores.reverse()
 
-        # 错题知识点分布（按频次排序）
         cursor = await db.execute(
             """SELECT knowledge_point, COUNT(*) as count
                FROM error_records WHERE student_id = ? AND knowledge_point != ''
@@ -454,7 +570,6 @@ async def get_student_profile(student_id: int) -> dict:
         )
         error_knowledge_distribution = [dict(r) for r in await cursor.fetchall()]
 
-        # 错误类型分布
         cursor = await db.execute(
             """SELECT error_type, COUNT(*) as count
                FROM error_records WHERE student_id = ? AND error_type != ''
@@ -463,7 +578,6 @@ async def get_student_profile(student_id: int) -> dict:
         )
         error_type_distribution = [dict(r) for r in await cursor.fetchall()]
 
-        # 历史练习次数
         cursor = await db.execute(
             "SELECT COUNT(*) as count FROM practice_sheets WHERE student_id = ?",
             (student_id,)
@@ -472,8 +586,8 @@ async def get_student_profile(student_id: int) -> dict:
 
         return {
             "basic_info": basic_info,
-            "total_homeworks": total_homeworks,
-            "avg_score": avg_score,
+            "total_homeworks": hw_stats['total'],
+            "avg_score": round(hw_stats['avg_score'], 1),
             "recent_scores": recent_scores,
             "error_knowledge_distribution": error_knowledge_distribution,
             "error_type_distribution": error_type_distribution,
@@ -485,10 +599,15 @@ async def get_student_profile(student_id: int) -> dict:
 
 # ============ Practice Sheet Operations ============
 
-async def create_practice_sheet(student_id: int, title: str, questions: str,
+async def create_practice_sheet(user_id: int, student_id: int, title: str, questions: str,
                                  target_knowledge_points: str, pdf_path: str = ""):
     db = await get_db()
     try:
+        cursor = await db.execute(
+            "SELECT id FROM students WHERE id = ? AND user_id = ?", (student_id, user_id)
+        )
+        if not await cursor.fetchone():
+            return None
         cursor = await db.execute(
             """INSERT INTO practice_sheets
                (student_id, title, questions, target_knowledge_points, pdf_path)
@@ -501,27 +620,38 @@ async def create_practice_sheet(student_id: int, title: str, questions: str,
         await db.close()
 
 
-async def get_practice_sheets(student_id: int = None):
+async def get_practice_sheets(user_id: int, student_id: int = None):
+    """练习列表 — 只返回当前用户的数据"""
     db = await get_db()
     try:
+        sql = """SELECT p.*, s.name as student_name
+                 FROM practice_sheets p
+                 JOIN students s ON p.student_id = s.id
+                 WHERE s.user_id = ?"""
+        params = [user_id]
         if student_id:
-            cursor = await db.execute(
-                """SELECT p.*, s.name as student_name
-                   FROM practice_sheets p
-                   JOIN students s ON p.student_id = s.id
-                   WHERE p.student_id = ?
-                   ORDER BY p.created_at DESC""",
-                (student_id,)
-            )
-        else:
-            cursor = await db.execute(
-                """SELECT p.*, s.name as student_name
-                   FROM practice_sheets p
-                   JOIN students s ON p.student_id = s.id
-                   ORDER BY p.created_at DESC"""
-            )
+            sql += " AND p.student_id = ?"
+            params.append(student_id)
+        sql += " ORDER BY p.created_at DESC"
+        cursor = await db.execute(sql, params)
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+async def get_practice_sheet(user_id: int, practice_id: int):
+    """单个练习 — 带 user_id 校验（下载 PDF 用）"""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """SELECT p.* FROM practice_sheets p
+               JOIN students s ON p.student_id = s.id
+               WHERE p.id = ? AND s.user_id = ?""",
+            (practice_id, user_id)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
     finally:
         await db.close()
 
@@ -530,8 +660,7 @@ async def update_practice_pdf_path(practice_id: int, pdf_path: str):
     db = await get_db()
     try:
         await db.execute(
-            "UPDATE practice_sheets SET pdf_path = ? WHERE id = ?",
-            (pdf_path, practice_id)
+            "UPDATE practice_sheets SET pdf_path = ? WHERE id = ?", (pdf_path, practice_id)
         )
         await db.commit()
     finally:
@@ -540,34 +669,53 @@ async def update_practice_pdf_path(practice_id: int, pdf_path: str):
 
 # ============ Dashboard Stats ============
 
-async def get_dashboard_stats():
+async def get_dashboard_stats(user_id: int):
+    """仪表盘统计 — 只统计当前用户的数据"""
     db = await get_db()
     try:
         stats = {}
 
-        cursor = await db.execute("SELECT COUNT(*) as count FROM students")
+        cursor = await db.execute(
+            "SELECT COUNT(*) as count FROM students WHERE user_id = ?", (user_id,)
+        )
         stats['total_students'] = (await cursor.fetchone())['count']
 
-        cursor = await db.execute("SELECT COUNT(*) as count FROM homework_submissions")
+        cursor = await db.execute(
+            """SELECT COUNT(*) as count FROM homework_submissions h
+               JOIN students s ON h.student_id = s.id WHERE s.user_id = ?""",
+            (user_id,)
+        )
         stats['total_homeworks'] = (await cursor.fetchone())['count']
 
-        cursor = await db.execute("SELECT COUNT(*) as count FROM error_records")
+        cursor = await db.execute(
+            """SELECT COUNT(*) as count FROM error_records e
+               JOIN students s ON e.student_id = s.id WHERE s.user_id = ?""",
+            (user_id,)
+        )
         stats['total_errors'] = (await cursor.fetchone())['count']
 
-        cursor = await db.execute("SELECT COUNT(*) as count FROM practice_sheets")
+        cursor = await db.execute(
+            """SELECT COUNT(*) as count FROM practice_sheets p
+               JOIN students s ON p.student_id = s.id WHERE s.user_id = ?""",
+            (user_id,)
+        )
         stats['total_practices'] = (await cursor.fetchone())['count']
 
         cursor = await db.execute(
-            "SELECT COALESCE(AVG(score), 0) as avg FROM homework_submissions WHERE status='completed'"
+            """SELECT COALESCE(AVG(h.score), 0) as avg FROM homework_submissions h
+               JOIN students s ON h.student_id = s.id
+               WHERE s.user_id = ? AND h.status='completed'""",
+            (user_id,)
         )
         stats['avg_score'] = round((await cursor.fetchone())['avg'], 1)
 
-        # Recent activities
         cursor = await db.execute(
             """SELECT h.id, h.score, h.status, h.created_at, s.name as student_name, 'homework' as type
                FROM homework_submissions h
                JOIN students s ON h.student_id = s.id
-               ORDER BY h.created_at DESC LIMIT 10"""
+               WHERE s.user_id = ?
+               ORDER BY h.created_at DESC LIMIT 10""",
+            (user_id,)
         )
         stats['recent_activities'] = [dict(row) for row in await cursor.fetchall()]
 
