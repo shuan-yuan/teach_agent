@@ -359,6 +359,58 @@ JSON 格式：
         return (f"{reason}；原始输出 {len(raw)} 字符。"
                 f"【开头】{head} … 【结尾】{tail}")
 
+    @staticmethod
+    def _extract_delta(delta) -> tuple:
+        """
+        从一个流式 delta 里取出（正式内容, 思考内容）。
+
+        字段名各家不统一，且 openai SDK 对非标准字段会丢进 model_extra：
+          正式内容：content
+          思考内容：reasoning_content（DeepSeek / Qwen / GLM 等）
+                    reasoning（部分厂商）
+
+        只读 content 会漏掉「推理型模型把整个 max_tokens 预算烧在思考上」这种情形 ——
+        现象是正文 0 字符、finish_reason 却是 length，用户只能看到一句没法诊断的报错。
+        """
+        def pick(*names):
+            for n in names:
+                v = getattr(delta, n, None)
+                if isinstance(v, str) and v:
+                    return v
+            extra = getattr(delta, "model_extra", None) or {}
+            for n in names:
+                v = extra.get(n)
+                if isinstance(v, str) and v:
+                    return v
+            return ""
+
+        return pick("content"), pick("reasoning_content", "reasoning")
+
+    @staticmethod
+    def _describe_no_content(reasoning_text: str, finish_reason) -> str:
+        """
+        正文一个字都没有时的诊断文案。
+
+        必须把「思考内容吃光了输出长度」和「模型压根没答/不支持读图」分开 ——
+        两者的处置方式完全不同，给同一句话等于让用户自己猜。
+        """
+        if reasoning_text:
+            head = reasoning_text[:160].replace("\n", " ")
+            tail = reasoning_text[-160:].replace("\n", " ")
+            return (
+                f"模型只输出了思考过程（{len(reasoning_text)} 字符），没有输出正式结果。"
+                f"原因：思考内容占满了本次输出长度上限（finish_reason={finish_reason}），"
+                f"正文还没开始写就被截断了。"
+                f"建议：换用不带「深度思考」的模型（或在模型设置里关闭思考模式），"
+                f"也可以把作业拆成两次上传，减少单次需要输出的题量。"
+                f"【思考开头】{head} … 【思考结尾】{tail}"
+            )
+        return (
+            f"模型没有返回任何内容（finish_reason={finish_reason}）。"
+            f"最常见的原因是所选模型不支持图片输入，或图片不清晰无法识别。"
+            f"请确认该模型支持视觉识别，或改用「文字输入」方式提交作业。"
+        )
+
     async def grade_homework(self, image_paths: list[str], subject: str = "数学") -> AsyncGenerator[dict, None]:
         """
         批改作业（视觉模式）- 流式返回思维链和结果
@@ -431,12 +483,18 @@ JSON 格式：
 
             yielded_grading = False
             finish_reason = None
+            reasoning_text = ""
             async for chunk in stream:
                 if chunk.choices:
                     if chunk.choices[0].finish_reason:
                         finish_reason = chunk.choices[0].finish_reason
-                    if chunk.choices[0].delta.content:
-                        text = chunk.choices[0].delta.content
+                    text, thinking = self._extract_delta(chunk.choices[0].delta)
+                    # 思考过程同样推给前端：推理型模型思考期可能长达几十秒，
+                    # 不推的话用户全程只看到「等待智能体输出…」，像卡死
+                    if thinking:
+                        reasoning_text += thinking
+                        yield {"type": "reasoning", "data": thinking}
+                    if text:
                         full_response += text
                         yield {"type": "content", "data": text}
 
@@ -456,6 +514,18 @@ JSON 格式：
 
             # finish_reason == "length" 说明模型输出被长度上限截断，JSON 必然不完整
             truncated = finish_reason == "length"
+
+            # 正文一个字都没有：先把原因说清楚再退出，
+            # 不要把「原始输出 0 字符」这种没法诊断的文案丢给用户
+            if not full_response.strip():
+                yield {"type": "thinking", "data": {
+                    "step": "grading",
+                    "message": "📝 批改中断：模型没有输出批改结果",
+                    "status": "done"
+                }}
+                yield {"type": "error", "data": self._describe_no_content(
+                    reasoning_text, finish_reason)}
+                return
 
             yield {"type": "thinking", "data": {
                 "step": "grading",
@@ -581,12 +651,17 @@ JSON 格式：
 
             yielded_grading = False
             finish_reason = None
+            reasoning_text = ""
             async for chunk in stream:
                 if chunk.choices:
                     if chunk.choices[0].finish_reason:
                         finish_reason = chunk.choices[0].finish_reason
-                    if chunk.choices[0].delta.content:
-                        text_chunk = chunk.choices[0].delta.content
+                    text_chunk, thinking = self._extract_delta(chunk.choices[0].delta)
+                    # 思考过程也推给前端，别让用户对着「等待智能体输出…」干等
+                    if thinking:
+                        reasoning_text += thinking
+                        yield {"type": "reasoning", "data": thinking}
+                    if text_chunk:
                         full_response += text_chunk
                         yield {"type": "content", "data": text_chunk}
 
@@ -604,6 +679,17 @@ JSON 格式：
                             yielded_grading = True
 
             truncated = finish_reason == "length"
+
+            # 正文为空时先给出可分辨的原因（思考烧光预算 / 模型没答），再收尾
+            if not full_response.strip():
+                yield {"type": "thinking", "data": {
+                    "step": "grading",
+                    "message": "📝 批改中断：模型没有输出批改结果",
+                    "status": "done"
+                }}
+                yield {"type": "error", "data": self._describe_no_content(
+                    reasoning_text, finish_reason)}
+                return
 
             yield {"type": "thinking", "data": {
                 "step": "grading",
@@ -772,12 +858,16 @@ JSON 格式：
 
             yielded_generating = False
             finish_reason = None
+            reasoning_text = ""
             async for chunk in stream:
                 if chunk.choices:
                     if chunk.choices[0].finish_reason:
                         finish_reason = chunk.choices[0].finish_reason
-                    if chunk.choices[0].delta.content:
-                        text = chunk.choices[0].delta.content
+                    text, thinking = self._extract_delta(chunk.choices[0].delta)
+                    if thinking:
+                        reasoning_text += thinking
+                        yield {"type": "reasoning", "data": thinking}
+                    if text:
                         full_response += text
                         yield {"type": "content", "data": text}
 
@@ -785,6 +875,13 @@ JSON 格式：
                             yield {"type": "thinking", "data": {"step": "design", "message": "🎯 题目设计完成", "status": "done"}}
                             yield {"type": "thinking", "data": {"step": "generate", "message": "✍️ 正在生成练习题...", "status": "active"}}
                             yielded_generating = True
+
+            # 正文为空的诊断与批改保持一致：思考烧光预算 / 模型没答，分开说
+            if not full_response.strip():
+                yield {"type": "thinking", "data": {"step": "generate", "message": "✍️ 练习生成中断：模型没有输出结果", "status": "done"}}
+                yield {"type": "error", "data": self._describe_no_content(
+                    reasoning_text, finish_reason)}
+                return
 
             yield {"type": "thinking", "data": {"step": "generate", "message": "✍️ 练习题生成完成", "status": "done"}}
 

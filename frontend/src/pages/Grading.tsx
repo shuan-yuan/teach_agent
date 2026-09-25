@@ -75,6 +75,8 @@ interface GradingSession {
   homeworkId: number;
   thinking: TStep[];
   stream: string;
+  /** 模型的思考过程（推理型模型会有），与正式输出分开显示 */
+  reasoning: string;
   result: GradingResult | null;
   error: string;
   phase: "grading" | "done";
@@ -94,6 +96,7 @@ function startGradingSession(homeworkId: number, studentName: string, onHistoryR
     homeworkId,
     thinking: [],
     stream: "",
+    reasoning: "",
     result: null,
     error: "",
     phase: "grading",
@@ -113,6 +116,10 @@ function startGradingSession(homeworkId: number, studentName: string, onHistoryR
         else { session.thinking = [...session.thinking, d.data]; }
       } else if (d.type === "content") {
         session.stream += d.data;
+      } else if (d.type === "reasoning") {
+        // 模型的思考过程：单独累积，用弱化样式显示。
+        // 不显示的后果是思考期间用户只看到「等待智能体输出…」，以为卡死。
+        session.reasoning += d.data;
       } else if (d.type === "result") {
         session.result = d.data;
         session.phase = "done";
@@ -183,6 +190,7 @@ export default function GradingPage() {
   const [phase, setPhase] = useState<"upload" | "grading" | "done">("upload");
   const [thinking, setThinking] = useState<TStep[]>([]);
   const [stream, setStream] = useState("");
+  const [reasoning, setReasoning] = useState("");
   const [result, setResult] = useState<GradingResult | null>(null);
   const [error, setError] = useState("");
   const [showTerm, setShowTerm] = useState(true);
@@ -206,6 +214,7 @@ export default function GradingPage() {
     setPhase(activeSession.phase);
     setThinking([...activeSession.thinking]);
     setStream(activeSession.stream);
+    setReasoning(activeSession.reasoning);
     setResult(activeSession.result);
     setError(activeSession.error);
     setViewingStudentName(activeSession.studentName);
@@ -221,7 +230,7 @@ export default function GradingPage() {
   // ── Auto-scroll terminal ──
   useEffect(() => {
     if (termRef.current) termRef.current.scrollTop = termRef.current.scrollHeight;
-  }, [stream]);
+  }, [stream, reasoning]);
 
   // ── On mount: restore from active session or URL param ──
   useEffect(() => {
@@ -495,7 +504,7 @@ export default function GradingPage() {
           )}
 
           {/* Thinking + Terminal — show during live grading OR when session has data */}
-          {(thinking.length > 0 || stream || phase === "grading") && (
+          {(thinking.length > 0 || stream || reasoning || phase === "grading") && (
             <div className="grading-panels">
               <div className="card">
                 <div className="card-title"><Brain size={16} style={{ color: "var(--purple)" }} /> 智能体思维链</div>
@@ -534,7 +543,9 @@ export default function GradingPage() {
                 </div>
                 {showTerm && (
                   <pre ref={termRef} className={`terminal-body ${phase === "grading" ? "stream-cursor" : ""}`}>
-                    {stream || "等待智能体输出…"}
+                    {reasoning && <span className="term-reasoning">{reasoning}</span>}
+                    {stream && <span>{reasoning ? "\n\n" : ""}{stream}</span>}
+                    {!reasoning && !stream && "等待智能体输出…"}
                   </pre>
                 )}
               </div>

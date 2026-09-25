@@ -317,6 +317,10 @@ body {
   padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 12px;
   color: #CDD6F4; line-height: 1.8; overflow-y: auto; flex: 1; min-height: 0;
 }
+/* 模型思考过程：弱化显示，与正式输出区分，让用户看到模型确实在动 */
+.term-reasoning {
+  color: #7F849C; font-style: italic; white-space: pre-wrap; word-break: break-word;
+}
 
 /* Result */
 .result-header {

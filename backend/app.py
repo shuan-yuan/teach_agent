@@ -470,7 +470,7 @@ async def grade_homework(homework_id: int, user: dict = Depends(auth.get_current
                 continue
             if event_type == "error":
                 had_error = True
-            if event_type in ("thinking", "content", "result", "error"):
+            if event_type in ("thinking", "content", "reasoning", "result", "error"):
                 yield f"data: {json.dumps({'type': event_type, 'data': data}, ensure_ascii=False)}\n\n"
             if event_type == "result":
                 full_result = data
@@ -637,7 +637,7 @@ async def generate_practice(data: dict, user: dict = Depends(auth.get_current_us
         ):
             event_type = event["type"]
             event_data = event["data"]
-            if event_type in ("thinking", "content", "result", "error"):
+            if event_type in ("thinking", "content", "reasoning", "result", "error"):
                 yield f"data: {json.dumps({'type': event_type, 'data': event_data}, ensure_ascii=False)}\n\n"
             if event_type == "result":
                 full_result = event_data
