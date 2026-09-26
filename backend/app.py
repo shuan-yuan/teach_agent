@@ -14,7 +14,7 @@ import asyncio
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends, Request, Response
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends, Request, Response, Body
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -24,7 +24,7 @@ import database as db
 import auth
 from llm_service import llm_service, LLMService
 from pdf_service import (generate_practice_pdf, generate_error_report_pdf,
-                         pdf_missing_cjk_font, font_status)
+                         pdf_missing_cjk_font, font_status, purge_student_exports)
 from file_parser import parse_files, ParseResult
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +35,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 MASK_SENTINEL = "__KEEP_EXISTING__"
+
+# 「清空我的数据」要求的确认串。服务端也校验一次：
+# 只靠前端弹窗拦不住脚本调用或误触后的重复提交。
+RESET_CONFIRM_TEXT = "清空"
 
 # 练习题生成的错题上限。全局模式（按科目出题）沿用 15 道；
 # 「按某一次批改的错题出题」放宽到 20 道 —— 这个范围是用户自己指定的，
@@ -576,6 +580,37 @@ async def delete_homework(homework_id: int, user: dict = Depends(auth.get_curren
     if not ok:
         raise HTTPException(404, "作业不存在")
     return {"success": True, "message": "删除成功"}
+
+
+@app.post("/api/data/reset")
+async def reset_my_data(data: dict = Body(default={}), user: dict = Depends(auth.get_current_user)):
+    """清空当前账号的批改记录 / 错题 / 练习 —— 保留学生档案与登录账号。
+
+    破坏性且不可恢复，所以服务端也要校验确认串。
+    清空范围永远由登录态推导（user["id"]），不接受客户端传 user_id / student_id，
+    避免越权清掉别人的数据。
+    """
+    confirm = str((data or {}).get("confirm", "")).strip()
+    if confirm != RESET_CONFIRM_TEXT:
+        raise HTTPException(400, "请输入「%s」两个字确认" % RESET_CONFIRM_TEXT)
+
+    # 先取学生名单：记录删完后，导出目录还得按学生名去清
+    students = await db.get_students(user["id"])
+    counts = await db.reset_user_records(user["id"])
+    # 清理导出文件是附带动作 —— 删不掉也不该让「记录已清空」变成 500
+    try:
+        removed_files = purge_student_exports([s["name"] for s in students])
+    except Exception:
+        removed_files = 0
+
+    return {
+        "success": True,
+        "deleted": counts,
+        "removed_files": removed_files,
+        "message": "已清空 %d 次批改记录、%d 道错题、%d 份练习" % (
+            counts["homework_submissions"], counts["error_records"], counts["practice_sheets"]
+        ),
+    }
 
 
 @app.get("/api/homework/{homework_id}")

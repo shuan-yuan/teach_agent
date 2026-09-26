@@ -282,6 +282,16 @@ export async function deleteHomework(
   return del(`/api/homework/${id}`);
 }
 
+/**
+ * 清空当前账号的批改记录 / 错题 / 练习（保留学生档案与登录账号）。
+ * 不可恢复 —— 后端同样要求确认串，前端弹窗只是第一道拦截。
+ */
+export async function resetMyData(
+  confirmText: string,
+): Promise<{ success: boolean; deleted: Record<string, number>; removed_files: number; message: string }> {
+  return post('/api/data/reset', { confirm: confirmText });
+}
+
 // ============================================================
 // Error Records
 // ============================================================

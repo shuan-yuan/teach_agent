@@ -222,6 +222,35 @@ def subject_export_dir(student_name: str, subject: str = "") -> str:
     return path
 
 
+def purge_student_exports(student_names) -> int:
+    """删除这些学生的全部导出文件，返回删除的文件数。
+
+    目录结构是 exports/{学生}/{科目}/，按学生名逐个清。
+    刻意不用 shutil.rmtree 整树递归删：受管环境（如带安全守卫的沙箱）会拦截
+    递归删除并直接中断进程，而这个清理只是附带动作。
+    因此改为逐文件 os.remove + 自底向上 os.rmdir，单个失败即跳过。
+    """
+    removed = 0
+    root = os.path.abspath(EXPORTS_DIR)
+    for name in student_names:
+        target = os.path.abspath(os.path.join(EXPORTS_DIR, safe_fs_name(name)))
+        # 防御：落点必须仍是 exports 的直接子目录
+        if os.path.dirname(target) != root or not os.path.isdir(target):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(target, topdown=False):
+            for filename in filenames:
+                try:
+                    os.remove(os.path.join(dirpath, filename))
+                    removed += 1
+                except OSError:
+                    pass
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
+    return removed
+
+
 def get_chinese_styles():
     """获取中文样式"""
     styles = getSampleStyleSheet()

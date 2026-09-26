@@ -438,6 +438,32 @@ async def delete_homework(user_id: int, homework_id: int) -> bool:
         await db.close()
 
 
+async def reset_user_records(user_id: int) -> dict:
+    """清空该用户全部批改记录 / 错题 / 练习 —— 保留学生档案与登录账号。
+
+    归属锚点只有 students 表（三张业务表都只挂 student_id，没有 user_id），
+    所以统一用子查询按 user_id 过滤，不给「误删到别人数据」留口子。
+    表名是固定白名单，不存在拼接注入。
+
+    返回各表实际删除的行数，供接口回报给用户、也便于核对范围。
+    """
+    db = await get_db()
+    try:
+        counts = {}
+        # 三张表都以 student_id 归属，逐个删即可；错题的 homework_id 指向已删作业也无妨
+        for table in ("error_records", "practice_sheets", "homework_submissions"):
+            cursor = await db.execute(
+                f"DELETE FROM {table} WHERE student_id IN "
+                "(SELECT id FROM students WHERE user_id = ?)",
+                (user_id,)
+            )
+            counts[table] = cursor.rowcount
+        await db.commit()
+        return counts
+    finally:
+        await db.close()
+
+
 async def create_homework_v2(user_id: int, student_id: int, subject: str, file_paths: list,
                              file_type: str = "image", content_text: str = ""):
     """创建作业记录 — 校验学生归属"""

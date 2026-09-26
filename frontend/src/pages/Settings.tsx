@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import {
   Eye, EyeOff, Check, AlertTriangle, Loader2, Zap, Globe, Key, Cpu, Settings,
-  ShieldCheck, Search, Lock,
+  ShieldCheck, Search, Lock, Trash2,
 } from "lucide-react";
-import { fetchConfig, saveConfig, testConfig, normalizeUrl, validateKey, fetchModels } from "../api/client";
+import { fetchConfig, saveConfig, testConfig, normalizeUrl, validateKey, fetchModels, resetMyData } from "../api/client";
+
+/** 与后端 RESET_CONFIRM_TEXT 保持一致 —— 两边都校验，避免只改一侧。 */
+const RESET_CONFIRM_TEXT = "清空";
 
 /**
  * 快捷预设。
@@ -28,6 +31,13 @@ export default function SettingsPage() {
   const [saving, setSaving]     = useState(false);
   const [testing, setTesting]   = useState(false);
   const [toast, setToast]       = useState<{ ok: boolean; msg: string } | null>(null);
+
+  // 「清空我的数据」两步确认：先展开确认区，输入「清空」后按钮才可点
+  const [resetOpen, setResetOpen]   = useState(false);
+  const [resetText, setResetText]   = useState("");
+  const [resetting, setResetting]   = useState(false);
+  const [resetMsg, setResetMsg]     = useState("");
+  const [resetMsgOk, setResetMsgOk] = useState(false);
 
   // 服务端从不回传明文 Key，只给掩码 + 是否已存在
   const [hasKey, setHasKey]           = useState(false);
@@ -133,6 +143,23 @@ export default function SettingsPage() {
       setModelDetectMsg(e.message || "检测失败，请手动输入模型名称");
     } finally {
       setDetectingModels(false);
+    }
+  };
+
+  const handleResetData = async () => {
+    setResetting(true);
+    setResetMsg("");
+    try {
+      const r = await resetMyData(RESET_CONFIRM_TEXT);
+      setResetMsgOk(true);
+      setResetMsg(r.message + (r.removed_files > 0 ? `，同时删除 ${r.removed_files} 个导出文件` : ""));
+      setResetOpen(false);
+      setResetText("");
+    } catch (e: any) {
+      setResetMsgOk(false);
+      setResetMsg(e.message || "清空失败，请重试");
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -279,6 +306,51 @@ export default function SettingsPage() {
             {testing ? <Loader2 size={14} className="anim-spin" /> : <Zap size={14} />} 测试连接
           </button>
         </div>
+      </div>
+
+      {/* ── 数据管理：清空本账号的批改记录 / 错题 / 练习 ── */}
+      <div className="card danger-card">
+        <h3 className="danger-title">
+          <Trash2 size={15} style={{ color: "var(--coral)" }} /> 数据管理
+        </h3>
+        <p className="danger-desc">
+          清空本账号的<strong>批改记录、错题和练习</strong>，导出的 PDF 一并删除。
+          学生档案和登录账号会保留 —— 清完就是「有学生、但还没批改过作业」的状态。
+        </p>
+
+        {!resetOpen ? (
+          <button className="btn-danger" onClick={() => { setResetOpen(true); setResetText(""); setResetMsg(""); }}>
+            <Trash2 size={14} /> 清空我的数据
+          </button>
+        ) : (
+          <div className="danger-confirm">
+            <p className="danger-warn">
+              <AlertTriangle size={14} /> 此操作不可恢复。请输入「{RESET_CONFIRM_TEXT}」两个字确认。
+            </p>
+            <input
+              className="form-input"
+              value={resetText}
+              onChange={e => setResetText(e.target.value)}
+              placeholder={RESET_CONFIRM_TEXT}
+            />
+            <div className="btn-row">
+              <button
+                className="btn-danger"
+                disabled={resetText.trim() !== RESET_CONFIRM_TEXT || resetting}
+                onClick={handleResetData}
+              >
+                {resetting ? <Loader2 size={14} className="anim-spin" /> : <Trash2 size={14} />} 确认清空
+              </button>
+              <button className="btn-secondary" onClick={() => { setResetOpen(false); setResetText(""); }}>
+                取消
+              </button>
+            </div>
+          </div>
+        )}
+
+        {resetMsg && (
+          <div className={`key-status ${resetMsgOk ? "valid" : "invalid"}`}>{resetMsg}</div>
+        )}
       </div>
 
       {toast && (

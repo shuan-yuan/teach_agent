@@ -383,6 +383,18 @@ body {
 .weak-tags span { background: #FFCC80; color: #E65100; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; }
 .error-msg { background: var(--coral-light); border: 1px solid rgba(255,107,107,0.2); border-radius: var(--radius-sm); padding: 12px 16px; font-size: 13px; color: var(--coral-dark); }
 
+/* ── 数据管理（危险操作） ── */
+.danger-card { border: 1px solid rgba(255,107,107,0.3); }
+.danger-title { display: flex; align-items: center; gap: 6px; font-size: 15px; font-weight: 700; color: var(--text-1); }
+.danger-desc { font-size: 13px; color: var(--text-2); line-height: 1.75; margin: 8px 0 14px; }
+.danger-desc strong { color: var(--text-1); }
+.danger-confirm { display: flex; flex-direction: column; gap: 10px; }
+.danger-warn { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--coral-dark); background: var(--coral-light); border-radius: var(--radius-sm); padding: 10px 12px; margin: 0; }
+/* 触摸目标不小于 44px：iPad 上手指点得中 */
+.btn-danger { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 44px; padding: 10px 18px; border: none; border-radius: var(--radius-sm); background: var(--coral); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; transition: filter .15s; }
+.btn-danger:hover:not(:disabled) { filter: brightness(0.94); }
+.btn-danger:disabled { opacity: .45; cursor: not-allowed; }
+
 /* ── 错题练习生成（批改详情页内嵌） ── */
 .hw-practice {
   margin-top: 16px; padding: 18px;
