@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { fetchStudents, uploadHomework, gradeHomeworkUrl, fetchHomeworkList, fetchHomeworkDetail, deleteHomework } from "../api/client";
 import type { Student, GradingResult, QuestionResult, HomeworkSubmission } from "../types";
-import { SUBJECTS, SUBJECT_AUTO } from "../constants";
+import { SUBJECTS, SUBJECT_AUTO, pickStudentId } from "../constants";
 
 function unwrap(r: any): Student[] { return Array.isArray(r) ? r : r?.students ?? []; }
 const stepIcons: Record<string, any> = { upload: Upload, receive: Upload, parse: FileText, recognize: Eye, grading: PenLine, analyze: BarChart3, report: BarChart3, save: CheckCircle2 };
@@ -197,7 +197,16 @@ export default function GradingPage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [history, setHistory] = useState<HomeworkSubmission[]>([]);
 
-  useEffect(() => { fetchStudents().then(r => setStudents(unwrap(r))).catch(() => {}); }, []);
+  // 进入本页自动选中「默认学生」—— 选学生这件事由学生管理页一次性配置好，
+  // 不必每次进来都手动挑。用函数式 setSid，避免覆盖用户已手动切换的选择
+  // （也保证 URL 上带过来的 student 参数优先）。
+  useEffect(() => {
+    fetchStudents().then(r => {
+      const list = unwrap(r);
+      setStudents(list);
+      setSid(cur => cur || pickStudentId(list));
+    }).catch(() => {});
+  }, []);
 
   const loadHistory = useCallback(() => {
     fetchHomeworkList().then(list => setHistory(Array.isArray(list) ? list : [])).catch(() => {});

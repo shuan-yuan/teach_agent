@@ -38,6 +38,8 @@ export interface Student {
   subject: string;
   avatar_color: string;
   created_at: string;
+  /** 默认学生：1 = 进入作业批改 / 错题分析 / 练习生成时自动选中（同一用户唯一） */
+  is_default: number;
   homework_count: number;
   avg_score: number;
   error_count: number;

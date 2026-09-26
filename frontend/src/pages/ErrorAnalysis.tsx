@@ -3,7 +3,7 @@ import { useSearchParams, useNavigate } from "react-router-dom";
 import { BookX, ChevronDown, Download, Target, Loader2, Search, CheckSquare, Square, Sparkles, TrendingUp, BookOpen, Award, AlertTriangle } from "lucide-react";
 import { fetchStudents, fetchHomeworkList, fetchSubjectOverview, fetchStudentErrors, getErrorReportPdfUrl } from "../api/client";
 import type { Student, ErrorRecord, ErrorStats, HomeworkSubmission, SubjectOverview } from "../types";
-import { SUBJECT_ALL, subjectColor } from "../constants";
+import { SUBJECT_ALL, subjectColor, pickStudentId } from "../constants";
 
 function unwrap(r: any): Student[] { return Array.isArray(r) ? r : r?.students ?? []; }
 
@@ -24,7 +24,16 @@ export default function ErrorAnalysisPage() {
   // Score trend data
   const [homeworks, setHomeworks] = useState<HomeworkSubmission[]>([]);
 
-  useEffect(() => { fetchStudents().then(r => setStudents(unwrap(r))).catch(() => {}); }, []);
+  // 进入本页自动选中「默认学生」—— 选学生这件事由学生管理页一次性配置好，
+  // 不必每次进来都手动挑。用函数式 setSid，避免覆盖用户已手动切换的选择
+  // （也保证 URL 上带过来的 student 参数优先）。
+  useEffect(() => {
+    fetchStudents().then(r => {
+      const list = unwrap(r);
+      setStudents(list);
+      setSid(cur => cur || pickStudentId(list));
+    }).catch(() => {});
+  }, []);
 
   // 科目概览 + 作业列表：只在切换学生时拉一次
   useEffect(() => {

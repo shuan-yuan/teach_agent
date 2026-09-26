@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { Users, Plus, Pencil, Trash2, BookOpen, Award, BookX, X, Loader2, UserPlus } from "lucide-react";
-import { fetchStudents, createStudent, updateStudent, deleteStudent } from "../api/client";
+import { Users, Plus, Pencil, Trash2, BookOpen, Award, BookX, X, Loader2, UserPlus, CheckSquare, Square } from "lucide-react";
+import { fetchStudents, createStudent, updateStudent, deleteStudent, setDefaultStudent } from "../api/client";
 import type { Student } from "../types";
 import { SUBJECTS } from "../constants";
 
@@ -20,6 +20,23 @@ export default function StudentsPage() {
 
   const flash = (m: string) => { setToast(m); setTimeout(() => setToast(""), 2500); };
   const handleDel = async () => { if (!del) return; try { await deleteStudent(del.id); flash("已删除"); setDel(null); load(); } catch { flash("删除失败"); } };
+
+  // 静默刷新：切默认学生时不走 load()，避免整页闪一下骨架屏
+  const refresh = () => fetchStudents().then(r => setList(unwrap(r))).catch(() => {});
+
+  /**
+   * 切换默认学生。同一时间只有一个 —— 后端会在设置时清掉其它学生的标记。
+   * 再点一次即取消；全部取消后，三个模块回到「需手动选择」的状态。
+   */
+  const toggleDefault = async (s: Student, e: React.MouseEvent) => {
+    e.stopPropagation();   // 卡片本身的点击是跳错题分析，别误触
+    const next = Number(s.is_default) !== 1;
+    try {
+      await setDefaultStudent(s.id, next);
+      flash(next ? `「${s.name}」已设为默认学生` : "已取消默认学生");
+      await refresh();
+    } catch { flash("操作失败"); }
+  };
 
   return (
     <div className="page-container" style={{ maxWidth: 1100, margin: "0 auto" }}>
@@ -43,11 +60,14 @@ export default function StudentsPage() {
       ) : (
         <div className="students-grid">
           {list.map(s => (
-            <div key={s.id} className="student-card" onClick={() => nav(`/errors?student=${s.id}`)}>
+            <div key={s.id} className={`student-card${Number(s.is_default) === 1 ? " is-default" : ""}`} onClick={() => nav(`/errors?student=${s.id}`)}>
               <div className="student-top">
                 <div className="student-avatar" style={{ background: s.avatar_color || "var(--coral)" }}>{s.name[0]}</div>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="student-name">{s.name}</div>
+                  <div className="student-name">
+                    {s.name}
+                    {Number(s.is_default) === 1 && <span className="default-badge">默认</span>}
+                  </div>
                   <div className="student-tags">
                     {s.grade && <span>{s.grade}</span>}
                     {s.class_name && <span>{s.class_name}</span>}
@@ -64,6 +84,14 @@ export default function StudentsPage() {
                 <div><Award size={12} style={{ color: "var(--text-3)" }} /><div className="ss-val" style={{ color: s.avg_score >= 80 ? "var(--teal)" : s.avg_score >= 60 ? "var(--amber)" : s.avg_score > 0 ? "var(--coral)" : undefined }}>{s.avg_score}</div><div className="ss-lbl">均分</div></div>
                 <div><BookX size={12} style={{ color: "var(--text-3)" }} /><div className="ss-val">{s.error_count}</div><div className="ss-lbl">错题</div></div>
               </div>
+              <button
+                className={`default-toggle${Number(s.is_default) === 1 ? " on" : ""}`}
+                onClick={e => toggleDefault(s, e)}
+                title="勾选后，作业批改 / 错题分析 / 练习生成 会自动选中该学生"
+              >
+                {Number(s.is_default) === 1 ? <CheckSquare size={15} /> : <Square size={15} />}
+                默认学生
+              </button>
             </div>
           ))}
         </div>

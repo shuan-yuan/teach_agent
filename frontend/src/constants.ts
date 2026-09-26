@@ -3,6 +3,8 @@
  * 后端对应 backend/database.py 顶部的 SUBJECTS，两边改动需同步。
  */
 
+import type { Student } from "./types";
+
 export const SUBJECTS = ["语文", "数学", "英语", "物理", "化学", "生物"] as const;
 
 /** 「全部科目」视图标识；传给后端时会被当成「不筛选」 */
@@ -35,4 +37,21 @@ export function subjectColor(subject: string): string {
 export function subjectOrder(subject: string): number {
   const i = (SUBJECTS as readonly string[]).indexOf(subject);
   return i === -1 ? 99 : i;
+}
+
+/**
+ * 决定进入某个模块时默认选中哪个学生。
+ *
+ * 优先级：默认学生 > 唯一的学生 > 空（需手动选择）。
+ * 「唯一的学生」这一档是为了照顾「只有一个孩子但忘了勾默认」的情况；
+ * 有多个学生且没设默认时保持空 —— 宁可让用户选一次，也不要猜错人。
+ *
+ * URL 上显式带来的 student（如错题分析 →「生成练习」的跳转）由调用方的
+ * `cur || pickStudentId(list)` 兜住，不会被这里覆盖。
+ */
+export function pickStudentId(students: Student[]): number | "" {
+  if (!students.length) return "";
+  const def = students.find(s => Number(s.is_default) === 1);
+  if (def) return def.id;
+  return students.length === 1 ? students[0].id : "";
 }

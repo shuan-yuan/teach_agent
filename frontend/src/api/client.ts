@@ -203,6 +203,17 @@ export async function deleteStudent(
   return del(`/api/students/${id}`);
 }
 
+/**
+ * 设为 / 取消默认学生。后端保证同一用户下最多一个默认。
+ * 取消后，作业批改 / 错题分析 / 练习生成 会回到「需手动选择学生」。
+ */
+export async function setDefaultStudent(
+  id: number,
+  isDefault: boolean,
+): Promise<{ success: boolean; is_default: boolean; message: string }> {
+  return put(`/api/students/${id}/default`, { is_default: isDefault });
+}
+
 // ============================================================
 // Homework
 // ============================================================

@@ -74,6 +74,9 @@ async def init_db():
                 class_name TEXT NOT NULL DEFAULT '',
                 subject TEXT NOT NULL DEFAULT '数学',
                 avatar_color TEXT NOT NULL DEFAULT '#4F46E5',
+                -- 默认学生：同一用户下最多一个。三个业务模块进入时自动选中它，
+                -- 省掉每次都要在下拉框里挑一遍。
+                is_default INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -138,6 +141,7 @@ async def init_db():
             "ALTER TABLE homework_submissions ADD COLUMN file_type TEXT DEFAULT 'image'",
             "ALTER TABLE homework_submissions ADD COLUMN content_text TEXT DEFAULT ''",
             "ALTER TABLE practice_sheets ADD COLUMN subject TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE students ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 await db.execute(stmt)
@@ -279,7 +283,8 @@ async def get_students(user_id: int):
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT * FROM students WHERE user_id = ? ORDER BY created_at DESC",
+            # 默认学生排最前，其余按创建时间倒序 —— 列表顺序与卡片上的「默认」标记一致
+            "SELECT * FROM students WHERE user_id = ? ORDER BY is_default DESC, created_at DESC",
             (user_id,)
         )
         rows = await cursor.fetchall()
@@ -311,9 +316,15 @@ async def create_student(user_id: int, name: str, grade: str, class_name: str, s
     color = random.choice(colors)
     db = await get_db()
     try:
+        # 该用户的第一个学生自动成为默认学生 —— 否则添加完还得再去点一次勾选
         cursor = await db.execute(
-            "INSERT INTO students (user_id, name, grade, class_name, subject, avatar_color) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, name, grade, class_name, subject, color)
+            "SELECT COUNT(*) AS n FROM students WHERE user_id = ?", (user_id,)
+        )
+        is_first = (await cursor.fetchone())["n"] == 0
+        cursor = await db.execute(
+            "INSERT INTO students (user_id, name, grade, class_name, subject, avatar_color, is_default)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, name, grade, class_name, subject, color, 1 if is_first else 0)
         )
         await db.commit()
         return cursor.lastrowid
@@ -336,6 +347,32 @@ async def update_student(user_id: int, student_id: int, name: str, grade: str,
         await db.close()
 
 
+async def set_default_student(user_id: int, student_id: int, is_default: bool = True) -> bool:
+    """设置 / 取消默认学生 —— 同一用户下最多一个。
+
+    设为默认时先清空该用户其它学生的标记，保证唯一性。
+    传 is_default=False 只取消这一个；全部取消后，三个业务模块回到「需手动选择」。
+    越权或学生不存在返回 False。
+    """
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id FROM students WHERE id=? AND user_id=?", (student_id, user_id)
+        )
+        if not await cursor.fetchone():
+            return False
+        if is_default:
+            await db.execute("UPDATE students SET is_default=0 WHERE user_id=?", (user_id,))
+        await db.execute(
+            "UPDATE students SET is_default=? WHERE id=? AND user_id=?",
+            (1 if is_default else 0, student_id, user_id)
+        )
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
 async def delete_student(user_id: int, student_id: int) -> bool:
     """删除学生及其关联数据 — 带 user_id 校验"""
     db = await get_db()
@@ -349,6 +386,17 @@ async def delete_student(user_id: int, student_id: int) -> bool:
         await db.execute("DELETE FROM homework_submissions WHERE student_id=?", (student_id,))
         await db.execute("DELETE FROM practice_sheets WHERE student_id=?", (student_id,))
         await db.execute("DELETE FROM students WHERE id=? AND user_id=?", (student_id, user_id))
+        # 删掉的若是默认学生，把默认转给剩下的第一个 ——
+        # 否则三个模块会突然全部变回「未选择」，用户以为设置丢了
+        cursor = await db.execute(
+            "SELECT COUNT(*) AS n FROM students WHERE user_id=? AND is_default=1", (user_id,)
+        )
+        if (await cursor.fetchone())["n"] == 0:
+            await db.execute(
+                "UPDATE students SET is_default=1 WHERE id = ("
+                "SELECT id FROM students WHERE user_id=? ORDER BY created_at DESC LIMIT 1)",
+                (user_id,)
+            )
         await db.commit()
         return True
     finally:

@@ -3,7 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { Target, Loader2, CheckCircle2, Download, RefreshCw, Sparkles, BookOpen, Eye, EyeOff, Star, ChevronDown, ChevronUp, Brain, Clock, Layers } from "lucide-react";
 import { fetchStudents, generatePractice, fetchPracticeList, getPracticePdfUrl, fetchSubjectOverview } from "../api/client";
 import type { Student, PracticeData, PracticeQuestion, PracticeSheet, SubjectOverview } from "../types";
-import { SUBJECT_ALL, subjectColor, DEFAULT_SUBJECT } from "../constants";
+import { SUBJECT_ALL, subjectColor, DEFAULT_SUBJECT, pickStudentId } from "../constants";
 
 function unwrapS(r: any): Student[] { return Array.isArray(r) ? r : r?.students ?? []; }
 function unwrapP(r: any): PracticeSheet[] { return Array.isArray(r) ? r : r?.practice_sheets ?? []; }
@@ -43,7 +43,16 @@ export default function PracticeGeneratorPage() {
   const [history, setHistory] = useState<PracticeSheet[]>([]);
   const termRef = useRef<HTMLPreElement>(null);
 
-  useEffect(() => { fetchStudents().then(r => setStudents(unwrapS(r))).catch(() => {}); }, []);
+  // 进入本页自动选中「默认学生」—— 选学生这件事由学生管理页一次性配置好，
+  // 不必每次进来都手动挑。用函数式 setSid，避免覆盖用户已手动切换的选择
+  // （也保证 URL 上带过来的 student 参数优先）。
+  useEffect(() => {
+    fetchStudents().then(r => {
+      const list = unwrapS(r);
+      setStudents(list);
+      setSid(cur => cur || pickStudentId(list));
+    }).catch(() => {});
+  }, []);
 
   // 科目概览：决定 Tab 上有哪些科目、哪几科有错题可出题
   useEffect(() => {

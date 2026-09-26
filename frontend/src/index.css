@@ -465,6 +465,24 @@ body {
 .student-stats .ss-val { font-size: 14px; font-weight: 700; color: var(--text-1); }
 .student-stats .ss-lbl { font-size: 10px; color: var(--text-3); margin-top: 2px; }
 
+/* ── 默认学生（勾选后三个业务模块进入时自动选中它） ── */
+.student-card.is-default { border-color: rgba(255,107,107,0.45); box-shadow: 0 4px 16px rgba(255,107,107,0.14); }
+.default-badge {
+  display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 4px;
+  background: var(--coral); color: #fff; font-size: 10px; font-weight: 600;
+  vertical-align: middle; line-height: 16px;
+}
+/* 触摸目标 ≥44px：整行可点，手指按得到（与「按钮不缩小」的约定一致） */
+.default-toggle {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  width: 100%; min-height: 44px; margin-top: 10px;
+  background: none; border: 1px dashed var(--border); border-radius: var(--radius-sm);
+  color: var(--text-3); font-size: 12px; font-weight: 600; font-family: inherit;
+  cursor: pointer; transition: all 0.18s;
+}
+.default-toggle:hover { border-color: rgba(255,107,107,0.4); color: var(--coral); background: rgba(255,107,107,0.04); }
+.default-toggle.on { border-style: solid; border-color: var(--coral); color: var(--coral); background: var(--coral-light); }
+
 .empty-state { display: flex; flex-direction: column; align-items: center; padding: 60px 0; text-align: center; color: var(--text-3); }
 
 /* ── Modal / Overlay ── */

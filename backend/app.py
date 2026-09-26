@@ -309,6 +309,20 @@ async def delete_student(student_id: int, user: dict = Depends(auth.get_current_
     return {"success": True, "message": "删除成功"}
 
 
+@app.put("/api/students/{student_id}/default")
+async def set_student_default(student_id: int, data: dict, user: dict = Depends(auth.get_current_user)):
+    """设为 / 取消默认学生。设为默认时由后端保证同一用户下唯一。"""
+    is_default = bool(data.get("is_default", True))
+    ok = await db.set_default_student(user["id"], student_id, is_default)
+    if not ok:
+        raise HTTPException(404, "学生不存在")
+    return {
+        "success": True,
+        "is_default": is_default,
+        "message": "已设为默认学生" if is_default else "已取消默认学生",
+    }
+
+
 @app.get("/api/students/{student_id}")
 async def get_student(student_id: int, user: dict = Depends(auth.get_current_user)):
     student = await db.get_student(user["id"], student_id)
