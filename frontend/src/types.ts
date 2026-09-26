@@ -62,6 +62,11 @@ export interface HomeworkSubmission {
   correct_count: number;
   status: string;
   created_at: string;
+  /**
+   * 这次批改落库的错题 id 列表（详情接口返回）。
+   * 前端用它显示「本次 N 道错题可出题」，也是「按这次错题生成练习」的范围依据。
+   */
+  error_ids?: number[];
 }
 
 export interface GradingResult {
@@ -71,6 +76,8 @@ export interface GradingResult {
   questions: QuestionResult[];
   overall_comment: string;
   weak_points: string[];
+  /** 模型判定的科目（批改结果里带回，用于科目标签配色与归档） */
+  subject?: string;
   /** 模型输出被长度上限截断，结果只包含已完成的题目 */
   truncated?: boolean;
 }

@@ -3,11 +3,12 @@ import { useSearchParams } from "react-router-dom";
 import {
   ImagePlus, X, Loader2, CheckCircle2, XCircle, Brain, Sparkles,
   ChevronDown, ChevronUp, Eye, PenLine, BarChart3, Upload, AlertTriangle,
-  FileText, FileType2, Type, ClipboardPaste, Clock, ArrowRight, Trash2,
+  FileText, FileType2, Type, ClipboardPaste, Clock, ArrowRight, Trash2, Target,
 } from "lucide-react";
-import { fetchStudents, uploadHomework, gradeHomeworkUrl, fetchHomeworkList, fetchHomeworkDetail, deleteHomework } from "../api/client";
-import type { Student, GradingResult, QuestionResult, HomeworkSubmission } from "../types";
+import { fetchStudents, uploadHomework, gradeHomeworkUrl, fetchHomeworkList, fetchHomeworkDetail, deleteHomework, generatePractice, getPracticePdfUrl } from "../api/client";
+import type { Student, GradingResult, QuestionResult, HomeworkSubmission, PracticeData } from "../types";
 import { SUBJECTS, SUBJECT_AUTO, pickStudentId } from "../constants";
+import PracticeResult from "../components/PracticeResult";
 
 function unwrap(r: any): Student[] { return Array.isArray(r) ? r : r?.students ?? []; }
 const stepIcons: Record<string, any> = { upload: Upload, receive: Upload, parse: FileText, recognize: Eye, grading: PenLine, analyze: BarChart3, report: BarChart3, save: CheckCircle2 };
@@ -191,6 +192,16 @@ export default function GradingPage() {
   const [error, setError] = useState("");
   const [showTerm, setShowTerm] = useState(true);
   const [viewingStudentName, setViewingStudentName] = useState("");
+  // 正在查看的这条批改记录属于哪个学生 —— 出题要用它，不能用上传区的选择
+  // （从历史记录点进来时，上传区的下拉可能还是空的或另一个学生）
+  const [viewingStudentId, setViewingStudentId] = useState<number | "">("");
+
+  // ── 错题练习生成：范围锁定「当前这条批改记录」的错题 ──
+  const [pPhase, setPPhase] = useState<"idle" | "gen" | "done">("idle");
+  const [pSteps, setPSteps] = useState<TStep[]>([]);
+  const [pData, setPData] = useState<PracticeData | null>(null);
+  const [pPid, setPPid] = useState<number | null>(null);
+  const [pErr, setPErr] = useState("");
 
   const [drag, setDrag] = useState(false);
   const termRef = useRef<HTMLPreElement>(null);
@@ -206,6 +217,11 @@ export default function GradingPage() {
       setStudents(list);
       setSid(cur => cur || pickStudentId(list));
     }).catch(() => {});
+  }, []);
+
+  /** 清空错题练习生成的状态（换记录 / 重新批改时调用） */
+  const clearPractice = useCallback(() => {
+    setPPhase("idle"); setPSteps([]); setPData(null); setPPid(null); setPErr("");
   }, []);
 
   const loadHistory = useCallback(() => {
@@ -258,6 +274,7 @@ export default function GradingPage() {
       if (!hw) return;
       const sName = hw.student_name ?? "";
       setViewingStudentName(sName);
+      setViewingStudentId(hw.student_id ?? "");
 
       if (hw.status === "completed" && hw.grading_result) {
         // Already completed — show saved result
@@ -348,6 +365,8 @@ export default function GradingPage() {
 
       setPhase("grading");
       setViewingStudentName(sName);
+      setViewingStudentId(studentId);
+      clearPractice();
       setUpl(false);
     } catch (e: any) { setError(e.message); setPhase("done"); setUpl(false); }
   };
@@ -356,12 +375,14 @@ export default function GradingPage() {
     clearGradingSession();
     setPhase("upload"); setThinking([]); setStream(""); setResult(null); setError("");
     setFiles([]); setPreviews([]); setContentText(""); setViewingStudentName("");
+    setViewingStudentId(""); clearPractice();
     setSp({});
     loadHistory();
   };
 
   const viewHomework = (hw: HomeworkSubmission) => {
     clearGradingSession();
+    clearPractice();
     setSp({ homework: String(hw.id) });
     loadHomeworkResult(hw.id);
   };
@@ -384,6 +405,49 @@ export default function GradingPage() {
       await deleteHomework(hwId);
       loadHistory();
     } catch { /* ignore */ }
+  };
+
+  /* ── 错题练习生成（范围 = 这条批改记录的错题） ── */
+
+  // homework id：URL 与活跃会话都指向当前这条记录
+  const currentHwId = Number(sp.get("homework")) || activeSession?.homeworkId || 0;
+  const wrongQuestions = (result?.questions ?? []).filter(q => !q.is_correct);
+
+  const generateErrorPractice = async () => {
+    const sid = viewingStudentId || studentId;
+    if (!sid || !currentHwId) return;
+    setPPhase("gen"); setPSteps([]); setPData(null); setPPid(null); setPErr("");
+    try {
+      // 只传 homework_id：科目与错题范围都由后端按这条记录决定。
+      // 前端再传 subject 反而可能让两处口径打架。
+      const reader = await generatePractice(Number(sid), undefined, undefined, currentHwId);
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n"); buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const d = JSON.parse(line.slice(6));
+            if (d.type === "thinking") {
+              setPSteps(p => {
+                const i = p.findIndex(s => s.step === d.data.step);
+                if (i >= 0) { const c = [...p]; c[i] = d.data; return c; }
+                return [...p, d.data];
+              });
+            } else if (d.type === "result") setPData(d.data);
+            else if (d.type === "error") setPErr(String(d.data));
+            else if (d.type === "done" && d.data?.practice_id) setPPid(d.data.practice_id);
+          } catch {}
+        }
+      }
+    } catch (e: any) {
+      setPErr(e?.message || "生成失败，请重试");
+    }
+    setPPhase("done");
   };
 
   const score = result?.score ?? 0;
@@ -601,6 +665,61 @@ export default function GradingPage() {
                 <div className="weak-points">
                   <h4><AlertTriangle size={14} /> 薄弱知识点</h4>
                   <div className="weak-tags">{result.weak_points.map((w, i) => <span key={i}>{w}</span>)}</div>
+                </div>
+              )}
+
+              {/* ── 错题练习生成：范围锁定这条批改记录的错题 ── */}
+              {currentHwId > 0 && (
+                <div className="hw-practice">
+                  <div className="hw-practice-head">
+                    <div style={{ minWidth: 0 }}>
+                      <h4><Target size={15} style={{ color: "var(--coral)" }} /> 错题练习生成</h4>
+                      <p>
+                        {wrongQuestions.length > 0
+                          ? <>范围：本次批改的 <strong style={{ color: "var(--coral)" }}>{wrongQuestions.length}</strong> 道错题，AI 据此生成一套分层练习</>
+                          : "这次作业全对，没有错题需要练"}
+                      </p>
+                    </div>
+                    <button
+                      className="start-btn hw-practice-btn"
+                      onClick={generateErrorPractice}
+                      disabled={wrongQuestions.length === 0 || pPhase === "gen"}
+                    >
+                      {pPhase === "gen" ? <Loader2 size={16} className="anim-spin" /> : <Sparkles size={16} />}
+                      {pPhase === "gen"
+                        ? "生成中…"
+                        : pPhase === "done" && pData
+                          ? "重新生成"
+                          : wrongQuestions.length > 0
+                            ? `生成错题练习（${wrongQuestions.length} 道）`
+                            : "无需生成"}
+                    </button>
+                  </div>
+
+                  {pSteps.length > 0 && (
+                    <div className="hw-practice-steps">
+                      {pSteps.map((t, i) => (
+                        <div key={i} className="hps-item">
+                          <span className={`hps-dot ${t.status === "done" ? "done" : ""}`}>
+                            {t.status === "done" ? <CheckCircle2 size={12} /> : <Loader2 size={12} className="anim-spin" />}
+                          </span>
+                          <span>{t.message}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {pErr && <div className="error-msg" style={{ marginTop: 12 }}>{pErr}</div>}
+
+                  {pData && (
+                    <div style={{ marginTop: 16 }}>
+                      <PracticeResult
+                        data={pData}
+                        subject={result.subject ?? ""}
+                        pdfUrl={pPid ? getPracticePdfUrl(pPid) : null}
+                      />
+                    </div>
+                  )}
                 </div>
               )}
 

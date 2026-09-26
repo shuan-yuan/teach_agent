@@ -587,6 +587,29 @@ async def get_error_records(user_id: int, student_id: int, subject: str = ""):
         await db.close()
 
 
+async def get_error_records_by_homework(user_id: int, homework_id: int):
+    """某一次批改记录里的错题 —— 「按这次作业的错题出练习」的取数入口。
+
+    归属校验直接写在 SQL 里（JOIN students s WHERE s.user_id = ?），
+    调用方不必再判一次越权。按题号升序，保证出题时范围稳定。
+    """
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """SELECT e.*, h.subject, h.created_at as homework_date
+               FROM error_records e
+               JOIN homework_submissions h ON e.homework_id = h.id
+               JOIN students s ON e.student_id = s.id
+               WHERE e.homework_id = ? AND s.user_id = ?
+               ORDER BY e.question_num ASC, e.id ASC""",
+            (homework_id, user_id)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
 async def get_error_stats(user_id: int, student_id: int, subject: str = ""):
     """获取学生错题统计 — 带 user_id 校验；subject 非空时统计范围限定在该科目"""
     db = await get_db()

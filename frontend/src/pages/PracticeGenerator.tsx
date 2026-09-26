@@ -1,18 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Target, Loader2, CheckCircle2, Download, RefreshCw, Sparkles, BookOpen, Eye, EyeOff, Star, ChevronDown, ChevronUp, Brain, Clock, Layers } from "lucide-react";
+import { Target, Loader2, CheckCircle2, Download, RefreshCw, Sparkles, ChevronDown, ChevronUp, Brain, Clock, Layers } from "lucide-react";
 import { fetchStudents, generatePractice, fetchPracticeList, getPracticePdfUrl, fetchSubjectOverview } from "../api/client";
-import type { Student, PracticeData, PracticeQuestion, PracticeSheet, SubjectOverview } from "../types";
+import type { Student, PracticeData, PracticeSheet, SubjectOverview } from "../types";
 import { SUBJECT_ALL, subjectColor, DEFAULT_SUBJECT, pickStudentId } from "../constants";
+import PracticeResult from "../components/PracticeResult";
 
 function unwrapS(r: any): Student[] { return Array.isArray(r) ? r : r?.students ?? []; }
 function unwrapP(r: any): PracticeSheet[] { return Array.isArray(r) ? r : r?.practice_sheets ?? []; }
-
-const levelMap: Record<string, { cls: string; stars: number }> = {
-  "基础巩固": { cls: "basic", stars: 1 },
-  "能力提升": { cls: "improve", stars: 2 },
-  "拓展挑战": { cls: "challenge", stars: 3 },
-};
 
 interface TStep { step: string; message: string; status: string }
 
@@ -39,7 +34,6 @@ export default function PracticeGeneratorPage() {
   const [results, setResults] = useState<GenResult[]>([]);
   const [error, setError] = useState("");
   const [showTerm, setShowT] = useState(true);
-  const [showAns, setShowAns] = useState<Set<string>>(new Set());
   const [history, setHistory] = useState<PracticeSheet[]>([]);
   const termRef = useRef<HTMLPreElement>(null);
 
@@ -110,7 +104,7 @@ export default function PracticeGeneratorPage() {
   /** 单选一科生成 */
   const startOne = async () => {
     if (!sid) return;
-    setPhase("gen"); setResults([]); setShowAns(new Set());
+    setPhase("gen"); setResults([]);
     try {
       const r = await runOne(subject, true);
       setResults([r]);
@@ -125,7 +119,7 @@ export default function PracticeGeneratorPage() {
     if (!sid) return;
     const targets = overview.filter(s => s.error_count > 0);
     if (!targets.length) { setError("该学生暂无错题记录，请先批改作业"); return; }
-    setPhase("gen"); setResults([]); setError(""); setShowAns(new Set());
+    setPhase("gen"); setResults([]); setError("");
     const acc: GenResult[] = [];
     for (const t of targets) {
       try {
@@ -138,7 +132,6 @@ export default function PracticeGeneratorPage() {
     setPhase("done");
   };
 
-  const toggleAns = (key: string) => setShowAns(s => { const n = new Set(s); n.has(key) ? n.delete(key) : n.add(key); return n; });
   const stu = students.find(s => s.id === sid);
 
   const sum = (f: (s: SubjectOverview) => number) => overview.reduce((a, s) => a + f(s), 0);
@@ -278,81 +271,19 @@ export default function PracticeGeneratorPage() {
             </div>
           )}
 
-          {/* ── 单科生成：完整展开 ── */}
-          {results.length === 1 && results[0].data && (() => {
-            const data = results[0].data!;
-            const grouped = data.questions?.reduce<Record<string, PracticeQuestion[]>>((a, q) => { (a[q.level || "基础巩固"] ??= []).push(q); return a; }, {}) ?? {};
-            return (
-              <>
-                <div className="result-header" style={{ flexWrap: "wrap" }}>
-                  <div style={{ flex: 1 }}>
-                    <h3 style={{ fontSize: 16, fontWeight: 700, color: "var(--text-1)" }}>
-                      {data.title}
-                      {results[0].subject && <span className="tag" style={{ marginLeft: 8, background: `${subjectColor(results[0].subject)}18`, color: subjectColor(results[0].subject) }}>{results[0].subject}</span>}
-                    </h3>
-                    {data.description && <p style={{ fontSize: 13, color: "var(--text-2)", marginTop: 4 }}>{data.description}</p>}
-                    {data.target_knowledge_points?.length > 0 && (
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 8 }}>
-                        {data.target_knowledge_points.map((k, i) => <span key={i} className="tag tag-indigo">{k}</span>)}
-                      </div>
-                    )}
-                  </div>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    {results[0].pid && <a href={getPracticePdfUrl(results[0].pid)} target="_blank" rel="noreferrer" className="btn-primary" style={{ textDecoration: "none", fontSize: 12 }}><Download size={13} /> 下载 PDF</a>}
-                    <button className="btn-secondary" onClick={() => { setPhase("idle"); setResults([]); setStream(""); setTh([]); }}><RefreshCw size={13} /> 重新生成</button>
-                  </div>
-                </div>
-
-                {Object.entries(grouped).map(([lv, qs]) => {
-                  const cfg = levelMap[lv] ?? levelMap["基础巩固"];
-                  return (
-                    <div key={lv} style={{ marginBottom: 16 }}>
-                      <div className={`level-header ${cfg.cls}`}>
-                        {Array.from({ length: cfg.stars }).map((_, i) => <Star key={i} size={14} fill="currentColor" />)}
-                        <span className="lv-name">{lv}</span>
-                        <span className="lv-count">（{qs.length}题）</span>
-                      </div>
-                      {qs.map(q => {
-                        const key = `${results[0].subject}-${lv}-${q.id}`;
-                        return (
-                          <div key={key} className="practice-q">
-                            <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-                              <span className="pq-num">{q.id}</span>
-                              <div style={{ flex: 1, minWidth: 0 }}>
-                                <p className="pq-text">{q.question}</p>
-                                {q.options && <div className="pq-options">{q.options.map((o, oi) => <div key={oi} className="pq-opt">{o}</div>)}</div>}
-                                <div className="pq-kp" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                                  {q.knowledge_point && <span className="tag tag-indigo">{q.knowledge_point}</span>}
-                                  <button className="ans-toggle" onClick={() => toggleAns(key)}>
-                                    {showAns.has(key) ? <><EyeOff size={11} /> 隐藏</> : <><Eye size={11} /> 答案</>}
-                                  </button>
-                                </div>
-                                {showAns.has(key) && (
-                                  <div className="ans-box">
-                                    <div><strong>答案：</strong>{q.answer}</div>
-                                    {q.solution && <div style={{ marginTop: 4 }}><strong>解析：</strong><span style={{ color: "var(--text-2)" }}>{q.solution}</span></div>}
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  );
-                })}
-
-                {data.study_suggestions && (
-                  <div className="study-tip">
-                    <h4><BookOpen size={14} /> 学习建议</h4>
-                    <p>{data.study_suggestions}</p>
-                  </div>
-                )}
-
-                <div className="ai-gen-label">以上练习题及解析内容由 AI 生成，基于国产大模型，仅供教学参考</div>
-              </>
-            );
-          })()}
+          {/* ── 单科生成：完整展开（展示逻辑与批改详情页共用 PracticeResult） ── */}
+          {results.length === 1 && results[0].data && (
+            <PracticeResult
+              data={results[0].data!}
+              subject={results[0].subject}
+              pdfUrl={results[0].pid ? getPracticePdfUrl(results[0].pid) : null}
+              actions={
+                <button className="btn-secondary" onClick={() => { setPhase("idle"); setResults([]); setStream(""); setTh([]); }}>
+                  <RefreshCw size={13} /> 重新生成
+                </button>
+              }
+            />
+          )}
 
           {results.length === 1 && results[0].error && (
             <div className="error-msg" style={{ marginTop: 16 }}>{results[0].subject}：{results[0].error}</div>

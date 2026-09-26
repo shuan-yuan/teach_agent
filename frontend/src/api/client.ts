@@ -315,11 +315,15 @@ export async function fetchSubjectOverview(
  * Generate a practice sheet via a POST request that returns an SSE stream.
  * Because `EventSource` only supports GET, we use `fetch` and return the
  * `ReadableStreamDefaultReader` so callers can consume chunks manually.
+ *
+ * 传 homeworkId 时后端只取那一次批改里的错题（批改详情页的「生成错题练习」），
+ * 不传则按 student + subject 出题。
  */
 export async function generatePractice(
   studentId: number,
   errorIds?: number[],
   subject?: string,
+  homeworkId?: number,
 ): Promise<ReadableStreamDefaultReader<Uint8Array>> {
   const res = await fetch(`${BASE}/api/practice/generate`, {
     method: 'POST',
@@ -330,6 +334,7 @@ export async function generatePractice(
       ...(errorIds !== undefined && { error_ids: errorIds }),
       // 「全部」视图不带 subject，由后端决定兜底科目
       ...(subject && subject !== SUBJECT_ALL && { subject }),
+      ...(homeworkId ? { homework_id: homeworkId } : {}),
     }),
   });
 

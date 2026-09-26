@@ -36,6 +36,12 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 
 MASK_SENTINEL = "__KEEP_EXISTING__"
 
+# 练习题生成的错题上限。全局模式（按科目出题）沿用 15 道；
+# 「按某一次批改的错题出题」放宽到 20 道 —— 这个范围是用户自己指定的，
+# 不该被一刀砍掉太多。
+PRACTICE_ERROR_LIMIT = 15
+PRACTICE_SCOPE_LIMIT = 20
+
 # 本地开发时前端跑在 5173，需要放行；生产环境同源部署不触发 CORS。
 DEV_ORIGINS = [
     "http://localhost:5173",
@@ -584,6 +590,11 @@ async def get_homework_detail(homework_id: int, user: dict = Depends(auth.get_cu
                 homework[field] = json.loads(homework[field])
             except Exception:
                 pass
+
+    # 这次批改落库的错题 id —— 前端据此显示「本次 N 道错题可出题」，
+    # 也让「按这次错题生成练习」的范围对用户可见（与页面上的错题一一对应）。
+    errors = await db.get_error_records_by_homework(user["id"], homework_id)
+    homework["error_ids"] = [e["id"] for e in errors]
     return homework
 
 
@@ -618,10 +629,15 @@ async def generate_practice(data: dict, user: dict = Depends(auth.get_current_us
 
     科目取自请求参数（用户在练习页选的那一科），不再取 student.subject ——
     后者是学生档案上的固定值，会把语文错题当数学来出题（本次修掉的 bug）。
+
+    两种范围：
+    - 不传 homework_id：按 student + subject 出题（练习生成页的常规用法）
+    - 传 homework_id：只取这条批改记录里的错题（批改详情页的「生成错题练习」）
     """
     student_id = data.get("student_id")
     error_ids = data.get("error_ids", [])
     subject = (data.get("subject") or "").strip()
+    homework_id = data.get("homework_id")
     if subject == db.SUBJECT_ALL:
         subject = ""
 
@@ -632,22 +648,47 @@ async def generate_practice(data: dict, user: dict = Depends(auth.get_current_us
     if not student:
         raise HTTPException(404, "学生不存在")
 
-    # 未指定科目（前端「全部」视图不选科直接调）时，挑错题最多的科目兜底。
-    # 关键：必须在取错题之前把科目定下来，否则会把多科错题混进同一个提示词
-    # —— 那正是这次要修掉的问题。
-    if not subject:
-        overview = await db.get_subject_overview(user["id"], student_id)
-        with_errors = [s for s in overview if s["error_count"] > 0]
-        subject = (max(with_errors, key=lambda s: s["error_count"])["subject"]
-                   if with_errors else db.DEFAULT_SUBJECT)
+    scope_msg = ""
+    if homework_id:
+        # ── 按「某一次批改」锁定范围 ──
+        # 只取这条记录里的错题，不掺其它作业、其它科目。批改详情页的
+        # 「生成错题练习」按钮走的就是这条路，出题范围与页面上的错题一致。
+        homework = await db.get_homework(user["id"], homework_id)
+        if not homework:
+            raise HTTPException(404, "批改记录不存在")
+        if homework["student_id"] != student_id:
+            raise HTTPException(400, "这条批改记录不属于所选学生")
 
-    errors = await db.get_error_records(user["id"], student_id, subject=subject)
-    if not errors:
-        raise HTTPException(400, f"该学生暂无{subject}错题记录，请先批改{subject}作业")
+        subject = (homework.get("subject") or "").strip() or subject
+        errors = await db.get_error_records_by_homework(user["id"], homework_id)
+        if not errors:
+            raise HTTPException(400, "这次作业全对，没有错题可出练习")
 
-    if error_ids:
-        errors = [e for e in errors if e["id"] in error_ids]
-    errors = errors[:15]
+        total = len(errors)
+        errors = errors[:PRACTICE_SCOPE_LIMIT]
+        if not subject:
+            # 未识别科目的作业（正常批改完成会回写，极少走到这）退回默认科目，
+            # 免得提示词里出现「你是一个经验丰富的教师」这种无科目句子。
+            subject = db.DEFAULT_SUBJECT
+        scope_msg = (f"🎯 范围锁定：这条批改记录的 {total} 道错题"
+                     + (f"，本次取其中 {len(errors)} 道" if total > len(errors) else ""))
+    else:
+        # 未指定科目（前端「全部」视图不选科直接调）时，挑错题最多的科目兜底。
+        # 关键：必须在取错题之前把科目定下来，否则会把多科错题混进同一个提示词
+        # —— 那正是这次要修掉的问题。
+        if not subject:
+            overview = await db.get_subject_overview(user["id"], student_id)
+            with_errors = [s for s in overview if s["error_count"] > 0]
+            subject = (max(with_errors, key=lambda s: s["error_count"])["subject"]
+                       if with_errors else db.DEFAULT_SUBJECT)
+
+        errors = await db.get_error_records(user["id"], student_id, subject=subject)
+        if not errors:
+            raise HTTPException(400, f"该学生暂无{subject}错题记录，请先批改{subject}作业")
+
+        if error_ids:
+            errors = [e for e in errors if e["id"] in error_ids]
+        errors = errors[:PRACTICE_ERROR_LIMIT]
 
     try:
         student_profile = await db.get_student_profile(user["id"], student_id)
@@ -658,6 +699,10 @@ async def generate_practice(data: dict, user: dict = Depends(auth.get_current_us
 
     async def event_stream():
         full_result = None
+
+        if scope_msg:
+            # 让用户看见服务端确实是按这次批改的范围在出题，而不是嘴上说说
+            yield f"data: {json.dumps({'type': 'thinking', 'data': {'step': 'scope', 'message': scope_msg, 'status': 'done'}}, ensure_ascii=False)}\n\n"
 
         async for event in svc.generate_practice(
             errors, student["name"], subject, student_profile=student_profile
