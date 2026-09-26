@@ -23,7 +23,8 @@ from fastapi.staticfiles import StaticFiles
 import database as db
 import auth
 from llm_service import llm_service, LLMService
-from pdf_service import generate_practice_pdf, generate_error_report_pdf
+from pdf_service import (generate_practice_pdf, generate_error_report_pdf,
+                         pdf_missing_cjk_font, font_status)
 from file_parser import parse_files, ParseResult
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -698,7 +699,13 @@ async def download_practice_pdf(practice_id: int, user: dict = Depends(auth.get_
         raise HTTPException(404, "练习题不存在")
 
     pdf_path = sheet.get("pdf_path", "")
-    if not pdf_path or not os.path.exists(pdf_path):
+    # 字体修复前生成的历史 PDF 里没嵌中文字体（中文全是方块）。
+    # 这类文件不直接发给用户，就地重新生成一份 —— 用户不必知道
+    # 「字体修好了但要重新生成」这回事，点一次下载就该拿到能看的 PDF。
+    stale_broken = (bool(pdf_path) and os.path.exists(pdf_path)
+                    and pdf_missing_cjk_font(pdf_path))
+    old_path = pdf_path
+    if not pdf_path or not os.path.exists(pdf_path) or stale_broken:
         questions_data = {
             "title": sheet.get("title", "练习题"),
             "questions": json.loads(sheet.get("questions") or "[]"),
@@ -706,8 +713,18 @@ async def download_practice_pdf(practice_id: int, user: dict = Depends(auth.get_
         }
         student = await db.get_student(user["id"], sheet["student_id"])
         student_name = student["name"] if student else ""
-        pdf_path = generate_practice_pdf(questions_data, student_name)
+        # 补生成（旧记录没有 pdf_path）时也要带上科目，
+        # 否则会落到 exports/{学生}/ 根目录且标题不带科目，和按科分层的约定不一致。
+        pdf_path = generate_practice_pdf(questions_data, student_name,
+                                         subject=sheet.get("subject", "") or "")
         await db.update_practice_pdf_path(practice_id, pdf_path)
+        # 方块版旧文件从磁盘清掉，免得以后有人直接翻 exports 目录又看到它
+        if stale_broken and old_path and os.path.abspath(old_path) != os.path.abspath(pdf_path):
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+        sheet["pdf_path"] = pdf_path
 
     return FileResponse(
         pdf_path, media_type="application/pdf", filename=os.path.basename(pdf_path)
@@ -762,6 +779,16 @@ async def serve_upload(filename: str):
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok"}
+
+
+@app.get("/api/health/font")
+async def health_font():
+    """字体自检 —— 线上 PDF 中文是否具备渲染条件。
+
+    无需鉴权：只回「有没有中文字体 / 字体来自哪一类 / 字体文件名」，
+    不含任何用户数据或绝对路径。发布后不必登录即可远程确认字体状态。
+    """
+    return font_status()
 
 
 # ==================== Frontend (SPA) ====================

@@ -16,24 +16,181 @@ from reportlab.platypus import (
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-# Register Chinese TTF font (embedded in PDF for proper display)
-CHINESE_FONT = 'Helvetica'  # fallback
-_FONT_PATHS = [
-    ('/System/Library/Fonts/STHeiti Medium.ttc', 0),     # macOS
-    ('/System/Library/Fonts/STHeiti Light.ttc', 0),       # macOS
-    ('/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc', 0),  # Linux
-    ('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', 0),  # Linux
-    ('C:/Windows/Fonts/msyh.ttc', 0),                     # Windows
-    ('C:/Windows/Fonts/simsun.ttc', 0),                    # Windows
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ── 中文字体注册 ──────────────────────────────────────────────────────
+# 踩坑记录：原先只从「系统字体路径」找中文字体，线上 Linux 容器没有 CJK 字体，
+# 于是静默回退到 Helvetica —— 中文全部渲染成方块，用户打开 PDF 才发现。
+# 现在把字体文件随代码一起分发（backend/fonts/），不依赖运行环境。
+#
+# 字体来源：Droid Sans Fallback Regular（Apache License 2.0），
+# 由 PyMuPDF/MuPDF 内置字体导出（见 tools/export_builtin_font.py），
+# 覆盖 CJK 基本区 + 扩展、拉丁、常用标点符号，共 50483 个字形。
+_FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+
+# 项目自带字体（最优先）。换字体只需把文件放进 fonts/ 并改这里。
+_BUNDLED_FONTS = [
+    ('DroidSansFallback.ttf', 0),
 ]
-for _fpath, _idx in _FONT_PATHS:
-    if os.path.exists(_fpath):
-        try:
-            pdfmetrics.registerFont(TTFont('ChineseFont', _fpath, subfontIndex=_idx))
+
+# 系统字体（兜底）。本地开发机通常命中这里。
+_SYSTEM_FONTS = [
+    ('/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc', 0),   # Linux
+    ('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', 0),   # Linux
+    ('/usr/share/fonts/truetype/wqy/wqy-microhei.ttc', 0),           # Linux
+    ('/System/Library/Fonts/STHeiti Medium.ttc', 0),                 # macOS
+    ('/System/Library/Fonts/STHeiti Light.ttc', 0),                  # macOS
+    ('C:/Windows/Fonts/msyh.ttc', 0),                                # Windows
+    ('C:/Windows/Fonts/simsun.ttc', 0),                              # Windows
+]
+
+CHINESE_FONT = 'Helvetica'   # 未找到中文字体时的回退（此时会报错，不静默出图）
+HAS_CJK_FONT = False
+_FONT_SOURCE = ''
+
+
+def _register_font_file(path: str, subfont_index: int = 0, name: str = 'ChineseFont') -> bool:
+    if not os.path.exists(path):
+        return False
+    try:
+        pdfmetrics.registerFont(TTFont(name, path, subfontIndex=subfont_index))
+        return True
+    except Exception as exc:      # 字体损坏 / reportlab 不支持的格式
+        logger.warning("中文字体注册失败，尝试下一个: %s (%s)", path, exc)
+        return False
+
+
+def _init_chinese_font() -> None:
+    """按「项目自带 > 系统」的顺序挑一个中文字体注册。"""
+    global CHINESE_FONT, HAS_CJK_FONT, _FONT_SOURCE
+
+    candidates = [(os.path.join(_FONT_DIR, fn), idx, 'bundled')
+                  for fn, idx in _BUNDLED_FONTS]
+    candidates += [(p, idx, 'system') for p, idx in _SYSTEM_FONTS]
+
+    for path, idx, kind in candidates:
+        if _register_font_file(path, idx):
             CHINESE_FONT = 'ChineseFont'
-            break
-        except Exception:
+            HAS_CJK_FONT = True
+            _FONT_SOURCE = f'{kind}:{path}'
+            # 只有一个字重，把 bold/italic 都指向它，
+            # 否则 reportlab 处理 <b> 标签时找不到变体字体。
+            pdfmetrics.registerFontFamily(
+                'ChineseFont', normal='ChineseFont', bold='ChineseFont',
+                italic='ChineseFont', boldItalic='ChineseFont',
+            )
+            logger.info("PDF 中文字体已启用 [%s] %s", kind, path)
+            return
+
+    logger.error(
+        "未找到任何中文字体！PDF 中文会显示为方块。"
+        "请确认 backend/fonts/ 目录下存在字体文件（如 DroidSansFallback.ttf）。"
+    )
+
+
+_init_chinese_font()
+
+
+def require_cjk_font() -> None:
+    """生成 PDF 前调用：没有中文字体就直接失败，不要产出满屏方块的废文件。"""
+    if not HAS_CJK_FONT:
+        raise RuntimeError(
+            "服务端缺少中文字体，无法生成 PDF（否则全文会显示成方块）。"
+            "请检查 backend/fonts/ 目录。"
+        )
+
+
+# ── 送进 PDF 的文本清理 ────────────────────────────────────────────────
+# emoji 不在中文字体的字形表里，直接写进 PDF 会渲染成空心豆腐块。
+# 只丢弃「落在 emoji/装饰符号码点区间 且 当前字体确实没有字形」的字符；
+# ★ ● ○ █ 这类符号也在部分区间内，但字体有字形，因此会被保留。
+_EMOJI_RANGES = (
+    (0x1F000, 0x1FAFF),   # 麻将牌 / 象形文字 / 表情 / 交通符号 / 补充符号
+    (0x1F1E6, 0x1F1FF),   # 区域指示符（国旗）
+    (0x2600, 0x27BF),     # 杂项符号 + 装饰符号
+    (0x2B00, 0x2BFF),     # 杂项符号与箭头
+    (0xFE00, 0xFE0F),     # 变体选择符
+    (0x200D, 0x200D),     # 零宽连接符
+    (0x20E3, 0x20E3),     # 组合包围键帽
+)
+
+_glyph_cache: dict = {}
+
+
+def _font_has_glyph(ch: str) -> bool:
+    """当前字体是否有该字符的字形（reportlab 内部 glyph id 为 0 表示 .notdef）"""
+    cp = ord(ch)
+    if cp in _glyph_cache:
+        return _glyph_cache[cp]
+    try:
+        face = pdfmetrics.getFont(CHINESE_FONT).face
+        ok = bool(face.charToGlyph.get(cp, 0))
+    except Exception:
+        ok = True      # 判定不了就放行，交给字体自身处理
+    _glyph_cache[cp] = ok
+    return ok
+
+
+def sanitize_pdf_text(text) -> str:
+    """剔除 PDF 字体渲染不出的 emoji，避免豆腐块。汉字与标点一律保留。"""
+    if text is None:
+        return ""
+    out = []
+    for ch in str(text):
+        cp = ord(ch)
+        if any(lo <= cp <= hi for lo, hi in _EMOJI_RANGES) and not _font_has_glyph(ch):
             continue
+        out.append(ch)
+    return "".join(out)
+
+
+def pdf_para(text, style) -> Paragraph:
+    """写进 PDF 的 Paragraph 统一走这里，保证文本已清理。"""
+    return Paragraph(sanitize_pdf_text(text), style)
+
+
+def font_status() -> dict:
+    """字体自检信息（供健康检查接口用，不含任何敏感数据）。"""
+    path = _FONT_SOURCE.split(":", 1)[1] if ":" in _FONT_SOURCE else ""
+    return {
+        "has_cjk_font": HAS_CJK_FONT,
+        "source": _FONT_SOURCE.split(":")[0] if _FONT_SOURCE else "none",
+        "font_name": CHINESE_FONT,
+        "file": os.path.basename(path),
+    }
+
+
+# 中文字体名特征词（用来判断一个已有 PDF 里有没有嵌中文字体）
+_CJK_FONT_MARKERS = ("Droid", "Noto", "YaHei", "SimSun", "SimHei", "Heiti",
+                     "Song", "Kai", "Ming", "WenQuanYi", "wqy", "SourceHan",
+                     "STSong", "STHeiti", "Fangsong")
+
+
+def pdf_missing_cjk_font(path: str) -> bool:
+    """判断一个已存在的 PDF 是否为「中文方块」的旧文件。
+
+    字体修复前生成的 PDF 里只嵌了 Helvetica，中文全是方块。
+    这类文件不该直接发给用户，需要就地重新生成。
+    判定不了时返回 False（不改变原有行为）。
+    """
+    try:
+        import pymupdf
+    except ImportError:
+        return False
+    try:
+        doc = pymupdf.open(path)
+        for pno in range(doc.page_count):
+            for f in doc[pno].get_fonts():
+                name = (f[3] or "") + " " + (f[4] or "") if len(f) > 4 else (f[3] or "")
+                if any(m.lower() in name.lower() for m in _CJK_FONT_MARKERS):
+                    doc.close()
+                    return False
+        doc.close()
+        return True
+    except Exception:
+        return False
 
 EXPORTS_DIR = os.path.join(os.path.dirname(__file__), "exports")
 os.makedirs(EXPORTS_DIR, exist_ok=True)
@@ -195,7 +352,11 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
     Returns:
         生成的 PDF 文件路径
     """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    require_cjk_font()
+
+    # 秒级时间戳在同一秒内生成两次会互相覆盖（批量生成时踩到过），补毫秒
+    _now = datetime.now()
+    timestamp = _now.strftime("%Y%m%d_%H%M%S") + f"{_now.microsecond // 1000:03d}"
     safe_name = safe_fs_name(student_name)
     subject_part = f"_{safe_fs_name(subject)}" if subject else ""
     filename = f"practice_{safe_name}{subject_part}_{timestamp}.pdf"
@@ -217,17 +378,17 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
     title = practice_data.get('title') or f"{student_name}{subject}专项练习"
     if subject and subject not in title:
         title = f"{title}（{subject}）"   # 大模型给的标题常常不带科目，这里补齐
-    story.append(Paragraph(title, styles['ChineseTitle']))
+    story.append(pdf_para(title, styles['ChineseTitle']))
 
     # Subtitle
     description = practice_data.get('description', '')
     if description:
-        story.append(Paragraph(description, styles['ChineseSubtitle']))
+        story.append(pdf_para(description, styles['ChineseSubtitle']))
 
     # Student info & date（科目单独标出，一叠 PDF 才好分辨是哪一科）
     subject_text = f"    科目: {subject}" if subject else ""
     info_text = f"学生: {student_name}{subject_text}    日期: {datetime.now().strftime('%Y年%m月%d日')}"
-    story.append(Paragraph(info_text, styles['ChineseSmall']))
+    story.append(pdf_para(info_text, styles['ChineseSmall']))
 
     story.append(Spacer(1, 6*mm))
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#E5E7EB')))
@@ -237,7 +398,7 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
     target_kps = practice_data.get('target_knowledge_points', [])
     if target_kps:
         kp_text = "针对知识点: " + "、".join(target_kps)
-        story.append(Paragraph(kp_text, styles['ChineseBody']))
+        story.append(pdf_para(kp_text, styles['ChineseBody']))
         story.append(Spacer(1, 3*mm))
 
     # === Questions by Level ===
@@ -285,7 +446,7 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
             textColor=colors.HexColor(color),
             fontName=CHINESE_FONT,
         )
-        story.append(Paragraph(f"{icon} {level_name}（共{len(level_info['questions'])}题）", level_style))
+        story.append(pdf_para(f"{icon} {level_name}（共{len(level_info['questions'])}题）", level_style))
 
         story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor(color)))
         story.append(Spacer(1, 2*mm))
@@ -300,7 +461,7 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
             # Question text
             diff_stars = "●" * difficulty + "○" * (5 - difficulty)
             meta = f"  <font size='8' color='#999999'>[难度: {diff_stars}  知识点: {kp}]</font>" if kp else ""
-            story.append(Paragraph(
+            story.append(pdf_para(
                 f"<b>{question_num}.</b> {q_text}{meta}",
                 styles['ChineseQuestion']
             ))
@@ -309,7 +470,7 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
             options = q.get('options')
             if options and isinstance(options, list):
                 for opt in options:
-                    story.append(Paragraph(str(opt), styles['ChineseOption']))
+                    story.append(pdf_para(str(opt), styles['ChineseOption']))
 
             # Answer space (if no answers included)
             if not include_answers:
@@ -319,7 +480,7 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
             else:
                 # Answer
                 answer = q.get('answer', '')
-                story.append(Paragraph(
+                story.append(pdf_para(
                     f"<b>参考答案:</b> {answer}",
                     styles['ChineseAnswer']
                 ))
@@ -327,7 +488,7 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
                 # Solution
                 solution = q.get('solution', '')
                 if solution:
-                    story.append(Paragraph(
+                    story.append(pdf_para(
                         f"<b>解题思路:</b> {solution}",
                         styles['ChineseSolution']
                     ))
@@ -340,18 +501,18 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
         story.append(Spacer(1, 6*mm))
         story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#E5E7EB')))
         story.append(Spacer(1, 4*mm))
-        story.append(Paragraph("📖 学习建议", styles['ChineseHeading']))
-        story.append(Paragraph(suggestions, styles['ChineseBody']))
+        story.append(pdf_para("学习建议", styles['ChineseHeading']))
+        story.append(pdf_para(suggestions, styles['ChineseBody']))
 
     # === Footer ===
     story.append(Spacer(1, 10*mm))
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#E5E7EB')))
     story.append(Spacer(1, 3*mm))
-    story.append(Paragraph(
+    story.append(pdf_para(
         f"以上练习题及解析内容由 AI 生成，基于国产大模型，仅供教学参考",
         styles['ChineseFooter']
     ))
-    story.append(Paragraph(
+    story.append(pdf_para(
         f"由教育智能体自动生成 | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         styles['ChineseFooter']
     ))
@@ -364,7 +525,11 @@ def generate_practice_pdf(practice_data: dict, student_name: str = "",
 def generate_error_report_pdf(student_name: str, errors: list, stats: dict,
                                subject: str = "") -> str:
     """生成错题报告 PDF（按科导出时 subject 非空，标题与落盘目录都会带上科目）"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    require_cjk_font()
+
+    # 秒级时间戳在同一秒内生成两次会互相覆盖（批量生成时踩到过），补毫秒
+    _now = datetime.now()
+    timestamp = _now.strftime("%Y%m%d_%H%M%S") + f"{_now.microsecond // 1000:03d}"
     safe_name = safe_fs_name(student_name)
     subject_part = f"_{safe_fs_name(subject)}" if subject else ""
     filename = f"error_report_{safe_name}{subject_part}_{timestamp}.pdf"
@@ -384,8 +549,8 @@ def generate_error_report_pdf(student_name: str, errors: list, stats: dict,
 
     # Title（带科目，否则三个科目的错题报告长得一模一样）
     label = f"{student_name} {subject}错题分析报告" if subject else f"{student_name} 错题分析报告"
-    story.append(Paragraph(label, styles['ChineseTitle']))
-    story.append(Paragraph(
+    story.append(pdf_para(label, styles['ChineseTitle']))
+    story.append(pdf_para(
         f"生成日期: {datetime.now().strftime('%Y年%m月%d日')}  共 {len(errors)} 道错题"
         + (f"  科目: {subject}" if subject else ""),
         styles['ChineseSubtitle']
@@ -395,41 +560,41 @@ def generate_error_report_pdf(student_name: str, errors: list, stats: dict,
     # Stats summary
     by_kp = stats.get('by_knowledge_point', [])
     if by_kp:
-        story.append(Paragraph("薄弱知识点分布", styles['ChineseHeading']))
+        story.append(pdf_para("薄弱知识点分布", styles['ChineseHeading']))
         for item in by_kp[:10]:
             bar_width = min(item['count'] * 4, 40)
             bar = "█" * bar_width
-            story.append(Paragraph(
+            story.append(pdf_para(
                 f"{item['knowledge_point']}: {bar} ({item['count']}次)",
                 styles['ChineseBody']
             ))
         story.append(Spacer(1, 4*mm))
 
     # Error list
-    story.append(Paragraph("错题详情", styles['ChineseHeading']))
+    story.append(pdf_para("错题详情", styles['ChineseHeading']))
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#E5E7EB')))
 
     for i, err in enumerate(errors, 1):
         story.append(Spacer(1, 3*mm))
-        story.append(Paragraph(
+        story.append(pdf_para(
             f"<b>错题 {i}</b>  [知识点: {err.get('knowledge_point', '未知')}  "
             f"错误类型: {err.get('error_type', '未知')}  难度: {err.get('difficulty', 3)}/5]",
             styles['ChineseQuestion']
         ))
-        story.append(Paragraph(f"题目: {err.get('question_text', '')}", styles['ChineseBody']))
-        story.append(Paragraph(f"学生答案: {err.get('student_answer', '')}", styles['ChineseAnswer']))
-        story.append(Paragraph(f"正确答案: {err.get('correct_answer', '')}", styles['ChineseAnswer']))
+        story.append(pdf_para(f"题目: {err.get('question_text', '')}", styles['ChineseBody']))
+        story.append(pdf_para(f"学生答案: {err.get('student_answer', '')}", styles['ChineseAnswer']))
+        story.append(pdf_para(f"正确答案: {err.get('correct_answer', '')}", styles['ChineseAnswer']))
         if err.get('analysis'):
-            story.append(Paragraph(f"分析: {err.get('analysis', '')}", styles['ChineseSolution']))
+            story.append(pdf_para(f"分析: {err.get('analysis', '')}", styles['ChineseSolution']))
         story.append(HRFlowable(width="100%", thickness=0.3, color=colors.HexColor('#EEEEEE')))
 
     # Footer
     story.append(Spacer(1, 10*mm))
-    story.append(Paragraph(
+    story.append(pdf_para(
         f"以上错题分析内容由 AI 生成，基于国产大模型，仅供教学参考",
         styles['ChineseFooter']
     ))
-    story.append(Paragraph(
+    story.append(pdf_para(
         f"由教育智能体自动生成 | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         styles['ChineseFooter']
     ))
